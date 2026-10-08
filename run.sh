@@ -2,7 +2,7 @@
 set -eu
 
 # Resolve paths relative to this script so it can be launched from anywhere.
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 
 # Prefer Podman when it is available, then fall back to Docker.
 if command -v podman >/dev/null 2>&1; then

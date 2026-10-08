@@ -1,0 +1,92 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM=${0##*/}
+VERSION=0.1.0
+
+RESET=
+BOLD=
+DIM=
+CYAN=
+GREEN=
+
+use_color=0
+case ${SD_VPNC_COLOR:-auto} in
+	always) use_color=1 ;;
+	never) use_color=0 ;;
+	*)
+		if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+			use_color=1
+		fi
+		;;
+esac
+
+if [ "$use_color" = 1 ]; then
+	ESC=$(printf '\033')
+	RESET="${ESC}[0m"
+	BOLD="${ESC}[1m"
+	DIM="${ESC}[2m"
+	CYAN="${ESC}[36m"
+	GREEN="${ESC}[32m"
+fi
+
+style() {
+	printf '%s%s%s' "$1" "$2" "$RESET"
+}
+
+banner() {
+	cat <<EOF
+
+$(style "$CYAN" '██╗   ██╗██████╗ ███╗   ██╗') $(style "$GREEN" '██████╗')
+$(style "$CYAN" '██║   ██║██╔══██╗████╗  ██║')$(style "$GREEN" '██╔════╝')
+$(style "$CYAN" '██║   ██║██████╔╝██╔██╗ ██║')$(style "$GREEN" '██║     ')
+$(style "$CYAN" '╚██╗ ██╔╝██╔═══╝ ██║╚██╗██║')$(style "$GREEN" '██║     ')
+$(style "$CYAN" ' ╚████╔╝ ██║     ██║ ╚████║')$(style "$GREEN" '╚██████╗')
+$(style "$CYAN" '  ╚═══╝  ╚═╝     ╚═╝  ╚═══╝')$(style "$GREEN" ' ╚═════╝')
+EOF
+}
+
+usage() {
+	cat <<EOF
+$(banner)
+
+${BOLD}sd-vpnc${RESET} ${DIM}v$VERSION${RESET} - OpenVPN container client
+
+${BOLD}Usage${RESET}:
+  $PROGRAM [ssh-host] [tmux-session]
+  $PROGRAM --help
+  $PROGRAM version
+
+The command starts the configured OpenVPN container. It accepts the same
+optional SSH host and tmux-session arguments as run.sh.
+
+Configuration:
+  SD_VPN_CONFIG       Provider .ovpn file (default: config/client.ovpn)
+  SD_VPN_CREDENTIALS  Optional credentials file
+  SD_SSH_CONFIG       SSH directory (default: ~/.ssh)
+EOF
+}
+
+version() {
+	if [ -t 1 ]; then
+		banner
+		printf '%s %s\n' "$(style "$BOLD" sd-vpnc)" "v$VERSION"
+	else
+		printf '%s\n' "$VERSION"
+	fi
+}
+
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+
+case ${1:-} in
+	-h|--help)
+		usage
+		;;
+	-v|--version|version)
+		version
+		;;
+	*)
+		exec "$script_dir/run.sh" "$@"
+		;;
+esac

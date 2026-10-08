@@ -2,7 +2,7 @@
 set -eu
 
 # Build from the repository root, regardless of the caller's current directory.
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 
 # Prefer Podman when it is available, then fall back to Docker.
 if command -v podman >/dev/null 2>&1; then

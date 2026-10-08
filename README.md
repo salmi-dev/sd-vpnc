@@ -45,6 +45,18 @@ Podman or Docker, and accepts the same optional host and tmux-session arguments:
 ./run.sh [ssh-host] [tmux-session]
 ```
 
+The `sd-vpnc` command is the versioned entry point around that helper:
+
+```bash
+./sd-vpnc [ssh-host] [tmux-session]
+./sd-vpnc --help
+./sd-vpnc version
+```
+
+The command is named `sd-vpnc` rather than `vpnc`: `vpnc` is already the widely
+used name of the vpnc Cisco-compatible VPN client, so claiming it would risk
+shadowing an installed system command.
+
 By default it reads `config/client.ovpn`, `config/credentials` when present,
 and `$HOME/.ssh`. Override those locations with `SD_VPN_CONFIG`,
 `SD_VPN_CREDENTIALS`, and `SD_SSH_CONFIG` when needed.
@@ -146,6 +158,13 @@ shown above. Put the username, hostname, identity file, and other connection
 settings in `~/.ssh/config`; an SSH config alias then avoids both username and
 password prompts. An `ssh-agent` can also be forwarded when the private key
 should not be mounted into the container.
+
+## Version and CI
+
+`sd-vpnc` follows SemVer and currently starts at `0.1.0`. The version is kept
+in the `VERSION` variable in the command script. GitHub Actions validates shell
+syntax, runs ShellCheck, and smoke-tests the help and version commands on pushes
+to `main` and pull requests.
 
 ## Security notes
 

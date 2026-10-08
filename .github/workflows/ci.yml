@@ -1,0 +1,35 @@
+name: CI
+run-name: CI · ${{ github.event_name }} · ${{ github.ref_name }} · ${{ github.sha }}
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  shell:
+    name: Shell validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Validate shell syntax
+        run: |
+          sh -n run.sh
+          sh -n build.sh
+          sh -n sd-vpnc
+
+      - name: Run ShellCheck
+        run: shellcheck run.sh build.sh sd-vpnc
+
+      - name: Smoke test command
+        run: |
+          SD_VPNC_COLOR=never ./sd-vpnc --help
+          SD_VPNC_COLOR=never ./sd-vpnc version
+          test "$(SD_VPNC_COLOR=never ./sd-vpnc --version)" = "$(sed -n 's/^VERSION=//p' sd-vpnc)"
