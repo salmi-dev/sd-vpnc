@@ -1,6 +1,8 @@
 # sd-vpnc
 
-[![CI](https://github.com/salmi-dev/sd-vpnc/actions/workflows/ci.yml/badge.svg)](https://github.com/salmi-dev/sd-vpnc/actions/workflows/ci.yml)
+[![CI](https://github.com/salmi-dev/salmidev-tools-vpn-client/actions/workflows/ci.yml/badge.svg)](https://github.com/salmi-dev/salmidev-tools-vpn-client/actions/workflows/ci.yml)
+[![Auto Release](https://github.com/salmi-dev/salmidev-tools-vpn-client/actions/workflows/auto-release.yml/badge.svg)](https://github.com/salmi-dev/salmidev-tools-vpn-client/actions/workflows/auto-release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/salmi-dev/salmidev-tools-vpn-client?label=release)](https://github.com/salmi-dev/salmidev-tools-vpn-client/releases/latest)
 ![POSIX sh](https://img.shields.io/badge/POSIX-sh-4EAA25)
 
 `sd-vpnc` is a single executable that starts an OpenVPN container and then
@@ -149,11 +151,22 @@ are required for OpenVPN. Only use configurations and images you trust.
 Provider configuration and credentials are bind-mounted read-only. Credentials
 are not copied into the image.
 
-## Version and CI
+## Version and CI/CD
 
-`sd-vpnc` follows SemVer and is currently at `0.2.4`. The version is kept in
-the `VERSION` variable in the executable. CI validates shell syntax, runs
-ShellCheck, and smoke-tests help and version output.
+`sd-vpnc` follows SemVer. The version is kept in the `VERSION` variable in the
+executable. CI validates shell syntax, runs ShellCheck, and smoke-tests help,
+version, and agent guidance on pull requests and pushes to `main`.
+
+After CI succeeds on a push to `main`, Auto Release creates a release commit
+that increments the patch version, pushes that commit, and creates a GitHub
+release with the executable attached as the `sd-vpnc` asset. The release step
+creates the tag only after the release commit has been pushed. The release
+commit triggers CI again but is excluded from a second automatic release.
+
+You can also run the Auto Release workflow manually and choose `major`, `minor`,
+or `patch`. The manual default is `minor`. See the
+[releases](https://github.com/salmi-dev/salmidev-tools-vpn-client/releases) page
+to download the executable.
 
 ## Name
 
