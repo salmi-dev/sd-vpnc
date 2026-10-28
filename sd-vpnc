@@ -3,9 +3,10 @@
 set -eu
 
 PROGRAM=${0##*/}
-VERSION=0.2.5
+VERSION=0.2.6
 IMAGE="localhost/sd-vpnc:$VERSION"
 CONTAINER_NAME="sd-vpnc-$(id -u)"
+TUN_CONTAINER_NAME="sd-vpnc-tun-$(id -u)"
 
 RESET=
 BOLD=
@@ -68,7 +69,8 @@ ${BOLD}Commands${RESET}:
   agent                              Print usage guidance for AI agents
   ssh [ssh-arguments ...]            Connect the VPN, then forward arguments to ssh
   ssh-tmux <ssh-host> [tmux-session] Connect SSH with an optional tmux session
-  tun <ssh-host> <mapping...>        Create local SSH tunnels through the VPN
+  tun <ssh-host> <mapping...>        Start host-accessible local tunnels in background
+  tun --stop                         Stop the background tunnel container
   shell                              Open a shell in the VPN container (starts it if needed)
   image [--rebuild]                  Build or rebuild the local container image
   version                            Print the version
@@ -176,6 +178,9 @@ openvpn \
   --log "$logfile"
 
 cleanup() {
+  if [[ -n "${ssh_pid:-}" ]]; then
+    kill "$ssh_pid" 2>/dev/null || true
+  fi
   if [[ -s "$pidfile" ]]; then
     kill "$(<"$pidfile")" 2>/dev/null || true
   fi
@@ -199,6 +204,8 @@ if ! compgen -G '/sys/class/net/tun*' >/dev/null; then
   cat "$logfile" >&2 || true
   exit 1
 fi
+
+touch /tmp/sd-vpnc-vpn-ready
 
 mode=${1:-shell}
 if [[ $# -gt 0 ]]; then
@@ -234,6 +241,76 @@ case "$mode" in
     else
       ssh "${ssh_args[@]}" "$host"
     fi
+    ;;
+  tun)
+    host=${1:-}
+    if [[ -z "$host" ]]; then
+      echo "A host is required for tun." >&2
+      exit 2
+    fi
+    shift
+    tunnel_args=()
+    tunnel_ports=()
+    while [[ $# -gt 0 ]]; do
+      mapping=$1
+      shift
+      case $mapping in
+        *:*:*)
+          local_port=${mapping%%:*}
+          remainder=${mapping#*:}
+          remote_host=${remainder%:*}
+          remote_port=${remainder##*:}
+          ;;
+        *:*)
+          local_port=${mapping%%:*}
+          remote_host=localhost
+          remote_port=${mapping#*:}
+          ;;
+        *) echo "Invalid port mapping: $mapping" >&2; exit 2 ;;
+      esac
+      if [[ ! "$local_port" =~ ^[0-9]+$ || ! "$remote_port" =~ ^[0-9]+$ || ! "$remote_host" =~ ^[[:alnum:]._-]+$ ]]; then
+        echo "Invalid port mapping: $mapping" >&2
+        exit 2
+      fi
+      tunnel_args+=(-L "0.0.0.0:$local_port:$remote_host:$remote_port")
+      tunnel_ports+=("$local_port")
+    done
+    ssh_log=/tmp/sd-vpnc-tun-ssh.log
+    ssh -v -N -T \
+      -o BatchMode=yes \
+      -o ConnectTimeout=20 \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      "${ssh_args[@]}" "${tunnel_args[@]}" "$host" >"$ssh_log" 2>&1 &
+    ssh_pid=$!
+    for _ in {1..45}; do
+      if ! kill -0 "$ssh_pid" 2>/dev/null; then
+        ssh_status=0
+        wait "$ssh_pid" || ssh_status=$?
+        cat "$ssh_log" >&2
+        exit "$ssh_status"
+      fi
+      forwards_ready=1
+      for local_port in "${tunnel_ports[@]}"; do
+        if ! grep -Fq "Local forwarding listening on 0.0.0.0 port $local_port." "$ssh_log"; then
+          forwards_ready=0
+          break
+        fi
+      done
+      if [[ "$forwards_ready" = 1 ]]; then
+        touch /tmp/sd-vpnc-tun-ready
+        echo "SSH tunnel is ready on the published local port(s)."
+        wait "$ssh_pid"
+        exit $?
+      fi
+      sleep 1
+    done
+    echo "Timed out waiting for SSH tunnel setup." >&2
+    cat "$ssh_log" >&2 || true
+    kill "$ssh_pid" 2>/dev/null || true
+    wait "$ssh_pid" 2>/dev/null || true
+    exit 1
     ;;
   *)
     echo "Unknown container command: $mode" >&2
@@ -319,9 +396,33 @@ status_item() {
 	printf '  %s %s %s\n' "$glyph" "$(style "$CYAN" "$label")" "$detail"
 }
 
-container_is_running() {
+container_is_running_named() {
+	name=$1
 	detect_container || return 1
-	[ "$("$container_command" container inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" = true ]
+	[ "$("$container_command" container inspect --format '{{.State.Running}}' "$name" 2>/dev/null || true)" = true ]
+}
+
+container_exists_named() {
+	name=$1
+	detect_container || return 1
+	"$container_command" container inspect "$name" >/dev/null 2>&1
+}
+
+container_is_running() {
+	container_is_running_named "$CONTAINER_NAME"
+}
+
+stop_tun() {
+	detect_container || die "Neither podman nor docker is installed."
+	if ! container_exists_named "$TUN_CONTAINER_NAME"; then
+		printf 'No tunnel container is running.\n'
+		return 0
+	fi
+	if container_is_running_named "$TUN_CONTAINER_NAME"; then
+		"$container_command" container stop "$TUN_CONTAINER_NAME" >/dev/null
+	fi
+	"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || true
+	printf 'Stopped tunnel %s.\n' "$TUN_CONTAINER_NAME"
 }
 
 status_cmd() {
@@ -370,11 +471,20 @@ status_cmd() {
 	else
 		status_item optional vpn-container "$CONTAINER_NAME (not running)"
 	fi
+
+	if container_is_running_named "$TUN_CONTAINER_NAME"; then
+		status_item ok tunnel "$TUN_CONTAINER_NAME (running)"
+	else
+		status_item optional tunnel "$TUN_CONTAINER_NAME (not running)"
+	fi
 }
 
 shell_cmd() {
 	detect_container || die "Neither podman nor docker is installed."
-	container_is_running || die "No running VPN container. Start one with '$PROGRAM ssh' or '$PROGRAM ssh <host>'."
+	if container_is_running_named "$TUN_CONTAINER_NAME"; then
+		exec "$container_command" exec -it "$TUN_CONTAINER_NAME" /bin/bash -i
+	fi
+	container_is_running || die "No running VPN container. Start one with '$PROGRAM ssh', '$PROGRAM ssh <host>', or '$PROGRAM tun <host> <mapping>'."
 	exec "$container_command" exec -it "$CONTAINER_NAME" /bin/bash -i
 }
 
@@ -413,6 +523,99 @@ run_container() {
 		-v "$ssh_config:/home/dev/.ssh:ro" \
 		-v "$workdir:/work" \
 		"$IMAGE" "$mode" "$@"
+}
+
+start_tun() {
+	host=$1
+	shift
+	detect_container || die "Neither podman nor docker is installed."
+	need_dir "$workdir"
+	need_dir "$ssh_config"
+	[ -f "$config" ] || die "VPN configuration file not found: $config (run '$PROGRAM init')"
+	if [ -e "$credentials" ] && [ ! -f "$credentials" ]; then
+		die "VPN credentials path is not a regular file: $credentials"
+	fi
+	[ "$#" -gt 0 ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
+
+	if container_is_running_named "$TUN_CONTAINER_NAME"; then
+		die "Tunnel '$TUN_CONTAINER_NAME' is already running; use '$PROGRAM tun --stop' first."
+	fi
+	publish_args=
+	forward_args=
+	seen_ports=
+	published_ports=
+	while [ "$#" -gt 0 ]; do
+		mapping=$1
+		shift
+		case $mapping in
+			*:*:*)
+				local_port=${mapping%%:*}
+				remainder=${mapping#*:}
+				remote_host=${remainder%:*}
+				remote_port=${remainder##*:}
+				;;
+			*:* )
+				local_port=${mapping%%:*}
+				remote_host=localhost
+				remote_port=${mapping#*:}
+				;;
+			*) die "Invalid port mapping '$mapping'; expected local:remote or local:host:remote" ;;
+		esac
+		case $remote_host in ''|*[!A-Za-z0-9._-]*) die "Invalid remote host in mapping '$mapping'" ;; esac
+		for port in "$local_port" "$remote_port"; do
+			case $port in ''|*[!0-9]*) die "Invalid port in mapping '$mapping': $port" ;; esac
+			awk -v port="$port" 'BEGIN { exit !(port >= 1 && port <= 65535) }' || die "Port out of range in mapping '$mapping': $port"
+		done
+		case " $seen_ports " in *" $local_port "*) die "Duplicate local port in tunnel mappings: $local_port" ;; esac
+		seen_ports="$seen_ports $local_port"
+		published_ports="$published_ports 127.0.0.1:$local_port"
+		publish_args="$publish_args -p 127.0.0.1:$local_port:$local_port"
+		forward_args="$forward_args $mapping"
+	done
+
+	if container_exists_named "$TUN_CONTAINER_NAME"; then
+		"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null
+	fi
+	if [ "$rebuild" = 1 ] || ! "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then
+		build_image
+	fi
+
+	uid=$(id -u)
+	gid=$(id -g)
+	IFS=' '
+	set -f
+	# The accumulated tokens contain only fixed flags, validated ports and
+	# validated hostnames; quote the SSH destination separately.
+	# shellcheck disable=SC2086
+	set -- $publish_args "$IMAGE" tun "$host" $forward_args
+	container_id=$("$container_command" run --detach \
+		--name "$TUN_CONTAINER_NAME" \
+		--cap-add=NET_ADMIN \
+		--device /dev/net/tun \
+		--user "$uid:$gid" \
+		--workdir /home/dev \
+		-e HOME=/home/dev \
+		-v "$config_dir:/config:ro" \
+		-v "$ssh_config:/home/dev/.ssh:ro" \
+		-v "$workdir:/work" \
+		"$@") || die "Failed to start the tunnel container."
+	printf 'Starting tunnel container %s.\n' "$TUN_CONTAINER_NAME"
+	waited=0
+	while [ "$waited" -lt 110 ]; do
+		if ! container_is_running_named "$TUN_CONTAINER_NAME"; then
+			"$container_command" logs "$TUN_CONTAINER_NAME" >&2 2>/dev/null || true
+			"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || true
+			die "Tunnel exited during startup. Check the VPN and non-interactive SSH key configuration."
+		fi
+		if "$container_command" exec "$TUN_CONTAINER_NAME" test -f /tmp/sd-vpnc-tun-ready >/dev/null 2>&1; then
+			printf 'Tunnel ready on%s. Use %s tun --stop to close it.\n' "$published_ports" "$PROGRAM"
+			printf 'Container id: %s\n' "$container_id"
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	printf 'Tunnel is still starting. Run %s status to check it, or %s tun --stop to cancel.\n' "$PROGRAM" "$PROGRAM"
 }
 
 container_command=
@@ -464,16 +667,18 @@ Setup:
 
 Connection commands (these may establish a VPN connection):
   $PROGRAM ssh [ssh-args...]       Start VPN; forward all arguments unchanged to ssh.
-  $PROGRAM ssh -L 8080:localhost:80 HOST
   $PROGRAM ssh HOST remote-command
   $PROGRAM ssh-tmux HOST [SESSION] Start SSH, optionally in a remote tmux session.
-  $PROGRAM tun HOST MAPPING...   Forward local ports; mappings are local:remote or local:host:remote.
+  $PROGRAM tun HOST MAPPING...   Start host-published forwards (LOCAL:REMOTE or LOCAL:HOST:REMOTE).
+  $PROGRAM tun --stop             Stop the background port-forward container.
   $PROGRAM shell                   Open a shell in the running VPN container, or start a VPN shell if none runs.
   $PROGRAM cli                     Alias for shell.
 
 Use normal OpenSSH argument ordering: SSH options before the host, then an optional remote command.
 With no arguments, 'ssh' starts an interactive shell inside the VPN container.
-A connection container is removed when its SSH session or interactive shell exits.
+For host-accessible forwards, use 'tun' rather than 'ssh -L': tunnel ports are published
+on 127.0.0.1 of the host. Detached tunnels require SSH authentication without prompts.
+Use 'tun --stop' to close it. A regular SSH container is removed when its session exits.
 Use 'shell' in another terminal to enter an active container. Starting a new 'shell' when
 none is active creates a fresh VPN container and interactive shell.
 
@@ -508,37 +713,16 @@ EOF
 		run_container ssh-tmux "$host" "$session"
 		;;
 	tun)
-		host=${1:-}
-		[ -n "$host" ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
-		shift
-		[ "$#" -gt 0 ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
-		set -- "$@" __SD_VPNC_TUN_END__
-		while [ "${1:-}" != __SD_VPNC_TUN_END__ ]; do
-			mapping=$1
+		if [ "${1:-}" = --stop ]; then
 			shift
-			case $mapping in
-				*:*:*)
-					local_port=${mapping%%:*}
-					remainder=${mapping#*:}
-					remote_host=${remainder%:*}
-					remote_port=${remainder##*:}
-					[ -n "$remote_host" ] || die "Invalid port mapping '$mapping': host must not be empty"
-					;;
-				*:* )
-					local_port=${mapping%%:*}
-					remote_host=localhost
-					remote_port=${mapping#*:}
-					;;
-				*) die "Invalid port mapping '$mapping'; expected local:remote or local:host:remote" ;;
-			esac
-			for port in "$local_port" "$remote_port"; do
-				case $port in ''|*[!0-9]*) die "Invalid port in mapping '$mapping': $port" ;; esac
-				awk -v port="$port" 'BEGIN { exit !(port >= 1 && port <= 65535) }' || die "Port out of range in mapping '$mapping': $port"
-			done
-			set -- "$@" -L "$local_port:$remote_host:$remote_port"
-		done
-		shift
-		run_container ssh "$@" "$host"
+			[ "$#" -eq 0 ] || die "Usage: $PROGRAM tun --stop"
+			stop_tun
+		else
+			host=${1:-}
+			[ -n "$host" ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
+			shift
+			start_tun "$host" "$@"
+		fi
 		;;
 	shell|cli)
 		[ "$#" -eq 0 ] || die "Usage: $PROGRAM shell"

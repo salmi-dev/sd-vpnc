@@ -86,9 +86,9 @@ Connect with an interactive shell, SSH, or SSH plus tmux:
 ```bash
 sd-vpnc ssh
 sd-vpnc ssh vpn-host
-sd-vpnc ssh -L 8080:localhost:80 vpn-host
 sd-vpnc ssh -o ConnectTimeout=10 vpn-host
 sd-vpnc tun vpn-host 8080:80 8443:localhost:443
+sd-vpnc tun --stop
 sd-vpnc ssh-tmux vpn-host work-session
 ```
 
@@ -112,9 +112,23 @@ sd-vpnc version
 so use normal `ssh` argument ordering: options first, then the host, followed by
 an optional remote command. With no arguments, it opens an interactive shell
 in the connected VPN container. `ssh-tmux` requires a host and optionally
-accepts a tmux session name. `tun` takes a host and one or more local port
-mappings: `LOCAL:REMOTE` forwards to `localhost:REMOTE`, while
-`LOCAL:HOST:REMOTE` specifies the destination host from the SSH server's side.
+accepts a tmux session name. For SSH local forwarding that should be reachable
+from the host machine, use `tun` rather than `ssh -L`:
+
+- `LOCAL:REMOTE` forwards host `127.0.0.1:LOCAL` to `localhost:REMOTE` as seen
+  from the SSH server.
+- `LOCAL:HOST:REMOTE` forwards host `127.0.0.1:LOCAL` to `HOST:REMOTE` as seen
+  from the SSH server.
+
+For example, `sd-vpnc tun vpn-host 8080:80 8443:db.internal:443` publishes both
+ports on the host's loopback interface. The command starts a detached container
+and returns to your prompt once the VPN and SSH forwarding listeners are ready.
+Stop the tunnel with `sd-vpnc tun --stop`.
+
+Since the tunnel is detached, SSH authentication and host-key verification must
+complete without prompts. Pre-accept the host key (e.g. by connecting with
+`sd-vpnc ssh HOST`) and use a key that requires no passphrase prompt;
+password/passphrase prompts are not supported by this command.
 
 A connection command keeps its named container alive until that SSH/shell
 session exits. While it is running, open another terminal and run:
