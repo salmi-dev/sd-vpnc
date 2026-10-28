@@ -3,13 +3,17 @@
 set -eu
 
 PROGRAM=${0##*/}
-VERSION=0.1.0
+VERSION=0.2.4
+IMAGE="localhost/sd-vpnc:$VERSION"
+CONTAINER_NAME="sd-vpnc-$(id -u)"
 
 RESET=
 BOLD=
 DIM=
 CYAN=
 GREEN=
+YELLOW=
+RED=
 
 use_color=0
 case ${SD_VPNC_COLOR:-auto} in
@@ -29,6 +33,8 @@ if [ "$use_color" = 1 ]; then
 	DIM="${ESC}[2m"
 	CYAN="${ESC}[36m"
 	GREEN="${ESC}[32m"
+	YELLOW="${ESC}[33m"
+	RED="${ESC}[31m"
 fi
 
 style() {
@@ -54,17 +60,34 @@ $(banner)
 ${BOLD}sd-vpnc${RESET} ${DIM}v$VERSION${RESET} - OpenVPN container client
 
 ${BOLD}Usage${RESET}:
-  $PROGRAM [ssh-host] [tmux-session]
-  $PROGRAM --help
-  $PROGRAM version
+  $PROGRAM [global-options] <command> [command-options] [arguments]
 
-The command starts the configured OpenVPN container. It accepts the same
-optional SSH host and tmux-session arguments as run.sh.
+${BOLD}Commands${RESET}:
+  init [--force]                     Create the configuration and work directories
+  status                             Show configuration, runtime, and image status
+  agent                              Print usage guidance for AI agents
+  ssh [ssh-arguments ...]            Connect the VPN, then forward arguments to ssh
+  ssh-tmux <ssh-host> [tmux-session] Connect SSH with an optional tmux session
+  tun <ssh-host> <mapping...>        Create local SSH tunnels through the VPN
+  shell                              Open a shell in the VPN container (starts it if needed)
+  image [--rebuild]                  Build or rebuild the local container image
+  version                            Print the version
 
-Configuration:
-  SD_VPN_CONFIG       Provider .ovpn file (default: config/client.ovpn)
-  SD_VPN_CREDENTIALS  Optional credentials file
-  SD_SSH_CONFIG       SSH directory (default: ~/.ssh)
+${BOLD}Global options${RESET}:
+  -C, --workdir DIR  Mount DIR as the container's /work directory
+  --rebuild          Rebuild the image before running a connection command
+  -h, --help         Show this help
+  -v, --version      Show the version
+
+Use '$PROGRAM status' to inspect the current setup.
+Use '$PROGRAM init' before the first connection.
+Use '$PROGRAM agent' for instructions intended for AI agents.
+
+Configuration defaults:
+  $config_dir/client.ovpn
+  $config_dir/credentials
+  $ssh_config
+  $workdir  (container /work)
 EOF
 }
 
@@ -77,16 +100,455 @@ version() {
 	fi
 }
 
-script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+die() {
+	printf '%s %s\n' "$(style "$RED" error)" "$*" >&2
+	exit 1
+}
 
-case ${1:-} in
-	-h|--help)
-		usage
+need_dir() {
+	[ -d "$1" ] || die "Directory not found: $1"
+}
+
+container_command=
+
+build_image() {
+	cache_home=${XDG_CACHE_HOME:-"$HOME/.cache"}
+	build_dir="$cache_home/sd-vpnc/build"
+	mkdir -p "$build_dir"
+
+	cat >"$build_dir/Containerfile" <<'CONTAINERFILE'
+FROM fedora:42
+
+LABEL org.opencontainers.image.title="sd-vpnc" \
+      org.opencontainers.image.description="Containerized OpenVPN client with SSH access"
+
+RUN dnf -y install \
+      bash \
+      ca-certificates \
+      iproute \
+      openssh-clients \
+      openvpn \
+      procps-ng \
+      tmux \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+RUN mkdir -p /config /home/dev /work && chmod 0755 /home/dev
+
+COPY entrypoint.sh /usr/local/bin/sd-vpnc-entrypoint
+RUN chmod 0755 /usr/local/bin/sd-vpnc-entrypoint
+
+ENV HOME=/home/dev
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/sd-vpnc-entrypoint"]
+CONTAINERFILE
+
+	cat >"$build_dir/entrypoint.sh" <<'ENTRYPOINT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+config=/config/client.ovpn
+credentials=/config/credentials
+vpn_config=/tmp/client.ovpn
+pidfile=/tmp/openvpn.pid
+logfile=/tmp/openvpn.log
+
+# Podman derives the runtime user's passwd home from the container workdir.
+# Start there as /home/dev so OpenSSH expands ~/.ssh correctly, then use the
+# mounted project directory as the actual working directory.
+cd /work
+
+if [[ ! -r "$config" ]]; then
+  echo "VPN configuration not found: $config" >&2
+  echo "Create ~/.config/sd-vpnc/client.ovpn or set SD_VPNC_CONFIG." >&2
+  exit 1
+fi
+
+cp "$config" "$vpn_config"
+if [[ -r "$credentials" ]]; then
+  printf '\nauth-user-pass %s\n' "$credentials" >> "$vpn_config"
+fi
+
+openvpn \
+  --config "$vpn_config" \
+  --daemon vpn-ssh-openvpn \
+  --writepid "$pidfile" \
+  --log "$logfile"
+
+cleanup() {
+  if [[ -s "$pidfile" ]]; then
+    kill "$(<"$pidfile")" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+for _ in {1..60}; do
+  if compgen -G '/sys/class/net/tun*' >/dev/null; then
+    break
+  fi
+  if [[ -s "$pidfile" ]] && ! kill -0 "$(<"$pidfile")" 2>/dev/null; then
+    echo "OpenVPN failed to start:" >&2
+    cat "$logfile" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! compgen -G '/sys/class/net/tun*' >/dev/null; then
+  echo "Timed out waiting for the VPN tunnel." >&2
+  cat "$logfile" >&2 || true
+  exit 1
+fi
+
+mode=${1:-shell}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+ssh_args=()
+if [[ -f "$HOME/.ssh/config" ]]; then
+  ssh_args=(-F "$HOME/.ssh/config")
+fi
+
+case "$mode" in
+  ssh)
+    if [[ $# -gt 0 ]]; then
+      ssh "${ssh_args[@]}" "$@"
+    else
+      echo "VPN is connected. OpenVPN log: $logfile"
+      /bin/bash -i
+    fi
+    ;;
+  ssh-tmux)
+    host=${1:-}
+    session=${2:-}
+    if [[ -z "$host" ]]; then
+      echo "A host is required for ssh-tmux." >&2
+      exit 2
+    fi
+    if [[ -n "$session" && ! "$session" =~ ^[[:alnum:]_.-]+$ ]]; then
+      echo "tmux session names may contain only letters, numbers, ., _, and -." >&2
+      exit 2
+    fi
+    if [[ -n "$session" ]]; then
+      ssh "${ssh_args[@]}" "$host" -t "tmux new -s '$session' || tmux attach -t '$session'"
+    else
+      ssh "${ssh_args[@]}" "$host"
+    fi
+    ;;
+  *)
+    echo "Unknown container command: $mode" >&2
+    exit 2
+    ;;
+esac
+ENTRYPOINT
+
+	printf '%s\n' "Building $IMAGE ..." >&2
+	"$container_command" build -t "$IMAGE" "$build_dir"
+}
+
+workdir=${XDG_DATA_HOME:-"$HOME/.local/share"}/sd-vpnc
+config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/sd-vpnc
+ssh_config=${SD_VPNC_SSH_CONFIG:-"$HOME/.ssh"}
+config=${SD_VPNC_CONFIG:-"$config_dir/client.ovpn"}
+credentials=${SD_VPNC_CREDENTIALS:-"$config_dir/credentials"}
+rebuild=0
+
+init_cmd() {
+	force=${1:-0}
+	mkdir -p "$config_dir" "$workdir"
+	if [ -e "$config" ] && [ "$force" != 1 ]; then
+		die "Configuration already exists: $config (use init --force to replace it)"
+	fi
+	cat >"$config" <<'EOF'
+client
+dev tun
+proto udp
+remote vpn.example.com 1194
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+verb 3
+
+# Add provider-specific settings here.
+# For username/password authentication, create credentials beside this file.
+EOF
+	cat >"$config_dir/credentials.example" <<'EOF'
+username
+password
+EOF
+	chmod 700 "$config_dir" "$workdir"
+	chmod 600 "$config" "$config_dir/credentials.example"
+	printf 'Initialized %s\n' "$config_dir"
+	printf 'Edit %s before connecting.\n' "$config"
+}
+
+detect_container() {
+	if [ -n "$container_command" ]; then
+		return 0
+	fi
+	if command -v podman >/dev/null 2>&1; then
+		container_command=podman
+	elif command -v docker >/dev/null 2>&1; then
+		container_command=docker
+	else
+		return 1
+	fi
+}
+
+status_item() {
+	state=$1
+	label=$2
+	detail=$3
+
+	case $state in
+		ok)
+			glyph=$(style "$GREEN" '✓')
+			;;
+		optional)
+			glyph=$(style "$YELLOW" '○')
+			;;
+		missing)
+			glyph=$(style "$RED" '✗')
+			;;
+		*)
+			glyph=$(style "$DIM" '?')
+			;;
+	esac
+
+	printf '  %s %s %s\n' "$glyph" "$(style "$CYAN" "$label")" "$detail"
+}
+
+container_is_running() {
+	detect_container || return 1
+	[ "$("$container_command" container inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" = true ]
+}
+
+status_cmd() {
+	banner
+	printf '%s %s\n\n' "$(style "$BOLD" sd-vpnc)" "$(style "$DIM" "v$VERSION")"
+	printf '%s\n' "$(style "$BOLD" Status)"
+
+	if detect_container; then
+		status_item ok container "$container_command ($(command -v "$container_command"))"
+	else
+		status_item missing container 'Podman or Docker not found'
+	fi
+
+	if [ -f "$config" ]; then
+		status_item ok config "$config"
+	else
+		status_item missing config "$config"
+	fi
+
+	if [ -f "$credentials" ]; then
+		status_item ok credentials "$credentials"
+	else
+		status_item optional credentials "not configured"
+	fi
+
+	if [ -d "$ssh_config" ]; then
+		status_item ok ssh-config "$ssh_config"
+	else
+		status_item missing ssh-config "$ssh_config"
+	fi
+
+	if [ -d "$workdir" ]; then
+		status_item ok workdir "$workdir"
+	else
+		status_item missing workdir "$workdir"
+	fi
+
+	if detect_container && "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then
+		status_item ok image "$IMAGE"
+	else
+		status_item optional image "$IMAGE (not built)"
+	fi
+
+	if container_is_running; then
+		status_item ok vpn-container "$CONTAINER_NAME (running)"
+	else
+		status_item optional vpn-container "$CONTAINER_NAME (not running)"
+	fi
+}
+
+shell_cmd() {
+	detect_container || die "Neither podman nor docker is installed."
+	container_is_running || die "No running VPN container. Start one with '$PROGRAM ssh' or '$PROGRAM ssh <host>'."
+	exec "$container_command" exec -it "$CONTAINER_NAME" /bin/bash -i
+}
+
+run_container() {
+	mode=$1
+	shift
+	detect_container || die "Neither podman nor docker is installed."
+	need_dir "$workdir"
+	need_dir "$ssh_config"
+	[ -f "$config" ] || die "VPN configuration file not found: $config (run '$PROGRAM init')"
+	if [ -e "$credentials" ] && [ ! -f "$credentials" ]; then
+		die "VPN credentials path is not a regular file: $credentials"
+	fi
+
+	if container_is_running; then
+		die "VPN container '$CONTAINER_NAME' is already running; use '$PROGRAM shell' to enter it."
+	fi
+	if "$container_command" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+		"$container_command" container rm "$CONTAINER_NAME" >/dev/null
+	fi
+
+	if [ "$rebuild" = 1 ] || ! "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then
+		build_image
+	fi
+
+	uid=$(id -u)
+	gid=$(id -g)
+	exec "$container_command" run --rm -it \
+		--name "$CONTAINER_NAME" \
+		--cap-add=NET_ADMIN \
+		--device /dev/net/tun \
+		--user "$uid:$gid" \
+		--workdir /home/dev \
+		-e HOME=/home/dev \
+		-v "$config_dir:/config:ro" \
+		-v "$ssh_config:/home/dev/.ssh:ro" \
+		-v "$workdir:/work" \
+		"$IMAGE" "$mode" "$@"
+}
+
+container_command=
+command=
+while [ "$#" -gt 0 ]; do
+	case $1 in
+		-h|--help) usage; exit 0 ;;
+		-v|--version) version; exit 0 ;;
+		-C|--workdir)
+			[ "$#" -ge 2 ] || die "$1 requires a directory"
+			workdir=$2; shift 2 ;;
+		--workdir=*) workdir=${1#*=}; shift ;;
+		--rebuild) rebuild=1; shift ;;
+		--) shift; break ;;
+		-*) die "Unknown option: $1" ;;
+		*) command=$1; shift; break ;;
+	esac
+done
+
+case ${command:-} in
+	'') usage; exit 1 ;;
+	version) version ;;
+	init)
+		force=0
+		[ "${1:-}" = --force ] && force=1 && shift
+		[ "$#" -eq 0 ] || die "Usage: $PROGRAM init [--force]"
+		init_cmd "$force"
 		;;
-	-v|--version|version)
-		version
+	status)
+		[ "$#" -eq 0 ] || die "Usage: $PROGRAM status"
+		status_cmd
 		;;
-	*)
-		exec "$script_dir/run.sh" "$@"
+	agent)
+		[ "$#" -eq 0 ] || die "Usage: $PROGRAM agent"
+		cat <<EOF
+sd-vpnc is a single executable that runs an OpenVPN client inside a Podman or Docker container.
+It can then start OpenSSH or an SSH/tmux session through the VPN.
+
+Safe discovery:
+  $PROGRAM status       Show config/runtime/image state without connecting.
+  $PROGRAM --help       Show commands and options.
+  $PROGRAM version      Print the version.
+
+Setup:
+  $PROGRAM init         Create default config and work directories; does not create a real provider config.
+  Edit $config before connecting. It currently exists: $([ -f "$config" ] && printf yes || printf no).
+  Credentials, if needed, belong at $credentials (two lines: username and password).
+  Keep VPN config and credentials private; do not print or expose their contents.
+
+Connection commands (these may establish a VPN connection):
+  $PROGRAM ssh [ssh-args...]       Start VPN; forward all arguments unchanged to ssh.
+  $PROGRAM ssh -L 8080:localhost:80 HOST
+  $PROGRAM ssh HOST remote-command
+  $PROGRAM ssh-tmux HOST [SESSION] Start SSH, optionally in a remote tmux session.
+  $PROGRAM tun HOST MAPPING...   Forward local ports; mappings are local:remote or local:host:remote.
+  $PROGRAM shell                   Open a shell in the running VPN container, or start a VPN shell if none runs.
+  $PROGRAM cli                     Alias for shell.
+
+Use normal OpenSSH argument ordering: SSH options before the host, then an optional remote command.
+With no arguments, 'ssh' starts an interactive shell inside the VPN container.
+A connection container is removed when its SSH session or interactive shell exits.
+Use 'shell' in another terminal to enter an active container. Starting a new 'shell' when
+none is active creates a fresh VPN container and interactive shell.
+
+Global options precede the command:
+  $PROGRAM -C DIRECTORY ssh HOST  Mount DIRECTORY at /work inside the container.
+  $PROGRAM --rebuild ssh HOST    Rebuild the local image before connecting.
+
+Image management:
+  $PROGRAM image                 Build the local image (no registry publish required).
+  $PROGRAM image --rebuild       Rebuild the local image.
+
+Requirements: Podman or Docker, /dev/net/tun, NET_ADMIN capability, and a valid VPN config.
+Do not start a connection or change user configuration unless asked.
+EOF
 		;;
+	image)
+		detect_container || die "Neither podman nor docker is installed."
+		[ "${1:-}" = --rebuild ] && shift
+		[ "$#" -eq 0 ] || die "Usage: $PROGRAM image [--rebuild]"
+		build_image
+		;;
+	ssh)
+		run_container ssh "$@"
+		;;
+	ssh-tmux)
+		host=${1:-}
+		[ -n "$host" ] || die "Usage: $PROGRAM ssh-tmux <ssh-host> [tmux-session]"
+		shift
+		session=${1:-}
+		if [ "$#" -gt 0 ]; then shift; fi
+		[ "$#" -eq 0 ] || die "Usage: $PROGRAM ssh-tmux <ssh-host> [tmux-session]"
+		run_container ssh-tmux "$host" "$session"
+		;;
+	tun)
+		host=${1:-}
+		[ -n "$host" ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
+		shift
+		[ "$#" -gt 0 ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
+		set -- "$@" __SD_VPNC_TUN_END__
+		while [ "${1:-}" != __SD_VPNC_TUN_END__ ]; do
+			mapping=$1
+			shift
+			case $mapping in
+				*:*:*)
+					local_port=${mapping%%:*}
+					remainder=${mapping#*:}
+					remote_host=${remainder%:*}
+					remote_port=${remainder##*:}
+					[ -n "$remote_host" ] || die "Invalid port mapping '$mapping': host must not be empty"
+					;;
+				*:* )
+					local_port=${mapping%%:*}
+					remote_host=localhost
+					remote_port=${mapping#*:}
+					;;
+				*) die "Invalid port mapping '$mapping'; expected local:remote or local:host:remote" ;;
+			esac
+			for port in "$local_port" "$remote_port"; do
+				case $port in ''|*[!0-9]*) die "Invalid port in mapping '$mapping': $port" ;; esac
+				awk -v port="$port" 'BEGIN { exit !(port >= 1 && port <= 65535) }' || die "Port out of range in mapping '$mapping': $port"
+			done
+			set -- "$@" -L "$local_port:$remote_host:$remote_port"
+		done
+		shift
+		run_container ssh "$@" "$host"
+		;;
+	shell|cli)
+		[ "$#" -eq 0 ] || die "Usage: $PROGRAM shell"
+		if container_is_running; then
+			shell_cmd
+		else
+			# Start a fresh VPN container with an interactive shell when there
+			# is no connection container to enter.
+			run_container ssh
+		fi
+		;;
+	*) die "Unknown command: $command (use '$PROGRAM --help')" ;;
 esac

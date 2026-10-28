@@ -21,15 +21,14 @@ jobs:
 
       - name: Validate shell syntax
         run: |
-          sh -n run.sh
-          sh -n build.sh
           sh -n sd-vpnc
 
       - name: Run ShellCheck
-        run: shellcheck run.sh build.sh sd-vpnc
+        run: shellcheck sd-vpnc
 
       - name: Smoke test command
         run: |
           SD_VPNC_COLOR=never ./sd-vpnc --help
           SD_VPNC_COLOR=never ./sd-vpnc version
+          SD_VPNC_COLOR=never ./sd-vpnc agent
           test "$(SD_VPNC_COLOR=never ./sd-vpnc --version)" = "$(sed -n 's/^VERSION=//p' sd-vpnc)"

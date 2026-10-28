@@ -1,183 +1,162 @@
-# sd-vpn-client
+# sd-vpnc
 
-A small Fedora-based container that starts OpenVPN from one mounted `.ovpn`
-file and then optionally opens an SSH session through the VPN.
+[![CI](https://github.com/salmi-dev/sd-vpnc/actions/workflows/ci.yml/badge.svg)](https://github.com/salmi-dev/sd-vpnc/actions/workflows/ci.yml)
+![POSIX sh](https://img.shields.io/badge/POSIX-sh-4EAA25)
 
-## Build
+`sd-vpnc` is a single executable that starts an OpenVPN container and then
+optionally opens an SSH or tmux session through the VPN. It supports Podman and
+Docker.
 
-Build the image directly with Docker or Podman:
+The executable contains the container definition and entrypoint. Users do not
+need a separate `Containerfile`, build script, or runtime script.
 
-```bash
-docker build -f Containerfile -t sd-vpn-client .
-# or: podman build -f Containerfile -t sd-vpn-client .
-```
+## Install
 
-The included `build.sh` helper detects Podman first and Docker second. It also
-passes the current user's UID, GID, and username into the image so mounted SSH
-files have matching ownership:
+Copy the executable somewhere on `PATH`:
 
 ```bash
-./build.sh
+install -m 755 sd-vpnc ~/.local/bin/sd-vpnc
 ```
 
-## Run
-
-The provider configuration must be mounted at exactly
-`/config/client.ovpn`. OpenVPN needs the TUN device and `NET_ADMIN`:
+The first run builds a local container image. Subsequent runs reuse it.
+Rebuild explicitly after changing the executable or container definition:
 
 ```bash
-docker run --rm -it \
-  --cap-add=NET_ADMIN \
-  --device=/dev/net/tun \
-  --mount type=bind,src="$PWD/config/client.ovpn",dst=/config/client.ovpn,readonly \
-  --mount type=bind,src="$HOME/.ssh",dst=/home/dev/.ssh,readonly \
-  sd-vpn-client
+sd-vpnc --rebuild
 ```
 
-The container starts OpenVPN in the background, waits for the tunnel, and then
-opens a shell. The entrypoint has no subcommands or OpenVPN options; put all
-VPN-specific settings in `client.ovpn`.
+The image is built locally, so no registry account or published image is
+required.
 
-The included `run.sh` helper mounts the standard configuration files, detects
-Podman or Docker, and accepts the same optional host and tmux-session arguments:
+## Configuration
+
+Create the configuration directory and copy the example files:
 
 ```bash
-./run.sh [ssh-host] [tmux-session]
+mkdir -p ~/.config/sd-vpnc
+cp config/client.ovpn.example ~/.config/sd-vpnc/client.ovpn
+cp config/credentials.example ~/.config/sd-vpnc/credentials
+chmod 700 ~/.config/sd-vpnc
+chmod 600 ~/.config/sd-vpnc/credentials
 ```
 
-The `sd-vpnc` command is the versioned entry point around that helper:
+Edit `client.ovpn` with the provider settings. The credentials file contains
+exactly two lines: username and password. It is optional when the provider uses
+certificate authentication or another authentication method.
 
-```bash
-./sd-vpnc [ssh-host] [tmux-session]
-./sd-vpnc --help
-./sd-vpnc version
-```
-
-The command is named `sd-vpnc` rather than `vpnc`: `vpnc` is already the widely
-used name of the vpnc Cisco-compatible VPN client, so claiming it would risk
-shadowing an installed system command.
-
-By default it reads `config/client.ovpn`, `config/credentials` when present,
-and `$HOME/.ssh`. Override those locations with `SD_VPN_CONFIG`,
-`SD_VPN_CREDENTIALS`, and `SD_SSH_CONFIG` when needed.
-
-### Create a configured launcher
-
-You can create a small wrapper around `run.sh` with all paths set in one
-place. Save this as, for example, `run-my-vpn.sh` in the project directory:
-
-```sh
-#!/bin/sh
-set -eu
-
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-
-export SD_VPN_CONFIG="$project_dir/config/my-provider.ovpn"
-export SD_VPN_CREDENTIALS="$project_dir/config/my-provider.credentials"
-export SD_SSH_CONFIG="$HOME/.ssh"
-
-exec "$project_dir/run.sh" "$@"
-```
-
-Make the launcher executable and use it like `run.sh`:
-
-```bash
-chmod 700 run-my-vpn.sh
-./run-my-vpn.sh [ssh-host] [tmux-session]
-```
-
-Keep the launcher and credentials private if they contain machine-specific
-paths or other sensitive configuration. The provider `.ovpn` and credentials
-files remain ignored by Git when stored under `config/`.
-
-Pass the SSH host as the first argument to connect immediately:
-
-```bash
-docker run --rm -it \
-  --cap-add=NET_ADMIN --device=/dev/net/tun \
-  -v "$PWD/config/client.ovpn:/config/client.ovpn:ro" \
-  -v "$HOME/.ssh:/home/dev/.ssh:ro" \
-  sd-vpn-client vpn-host
-```
-
-Pass a second argument to create or attach to a tmux session on that host:
-
-```bash
-sd-vpn-client vpn-host work-session
-```
-
-This runs the equivalent of:
-
-```bash
-ssh vpn-host -t "tmux new -s work-session || tmux attach -t work-session"
-```
-
-The first argument can be an SSH config alias or a normal target such as
-`user@internal-host`.
-
-## Avoid entering credentials every time
-
-### VPN credentials
-
-Create `config/credentials` on the host with exactly two lines:
+The default paths are:
 
 ```text
-my-vpn-username
-my-vpn-password
+~/.config/sd-vpnc/client.ovpn
+~/.config/sd-vpnc/credentials
+~/.ssh
+~/.local/share/sd-vpnc/       default container work directory
+~/.cache/sd-vpnc/             generated build context
 ```
 
-Protect it and reference it from `client.ovpn`:
+`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME` are respected.
+`SD_VPNC_CONFIG`, `SD_VPNC_CREDENTIALS`, and `SD_VPNC_SSH_CONFIG` can override
+individual configuration paths. The default paths are printed by `sd-vpnc
+--help` and `sd-vpnc status`.
+
+## Usage
+
+Initialize the configuration directory:
 
 ```bash
-chmod 600 config/credentials
+sd-vpnc init
 ```
 
-```ovpn
-auth-user-pass /config/credentials
-```
-
-Mount it read-only in addition to the `.ovpn` file:
+Inspect the local setup:
 
 ```bash
-docker run --rm -it \
-  --cap-add=NET_ADMIN --device=/dev/net/tun \
-  --mount type=bind,src="$PWD/config/client.ovpn",dst=/config/client.ovpn,readonly \
-  --mount type=bind,src="$PWD/config/credentials",dst=/config/credentials,readonly \
-  --mount type=bind,src="$HOME/.ssh",dst=/home/dev/.ssh,readonly \
-  sd-vpn-client
+sd-vpnc status
 ```
 
-OpenVPN reads the first line as the username and the second as the password.
-This avoids prompting on every run without putting the password into the
-`.ovpn` file.
+For concise tool instructions intended for AI agents, run:
 
-### SSH credentials
+```bash
+sd-vpnc agent
+```
 
-Use SSH public-key authentication and mount the host's `.ssh` directory, as
-shown above. Put the username, hostname, identity file, and other connection
-settings in `~/.ssh/config`; an SSH config alias then avoids both username and
-password prompts. An `ssh-agent` can also be forwarded when the private key
-should not be mounted into the container.
+Connect with an interactive shell, SSH, or SSH plus tmux:
+
+```bash
+sd-vpnc ssh
+sd-vpnc ssh vpn-host
+sd-vpnc ssh -L 8080:localhost:80 vpn-host
+sd-vpnc ssh -o ConnectTimeout=10 vpn-host
+sd-vpnc tun vpn-host 8080:80 8443:localhost:443
+sd-vpnc ssh-tmux vpn-host work-session
+```
+
+Manage the local image explicitly:
+
+```bash
+sd-vpnc image
+sd-vpnc image --rebuild
+```
+
+Global options may appear before the subcommand:
+
+```bash
+sd-vpnc -C "$PWD" ssh vpn-host
+sd-vpnc --workdir ~/projects/my-repository ssh-tmux vpn-host work-session
+sd-vpnc --help
+sd-vpnc version
+```
+
+`ssh` passes all arguments after the subcommand directly to the OpenSSH client,
+so use normal `ssh` argument ordering: options first, then the host, followed by
+an optional remote command. With no arguments, it opens an interactive shell
+in the connected VPN container. `ssh-tmux` requires a host and optionally
+accepts a tmux session name. `tun` takes a host and one or more local port
+mappings: `LOCAL:REMOTE` forwards to `localhost:REMOTE`, while
+`LOCAL:HOST:REMOTE` specifies the destination host from the SSH server's side.
+
+A connection command keeps its named container alive until that SSH/shell
+session exits. While it is running, open another terminal and run:
+
+```bash
+sd-vpnc shell
+# `sd-vpnc cli` is an alias
+```
+
+This opens an additional shell in the existing VPN-connected container. If no
+container is active, `shell` starts a VPN container and opens its interactive
+shell. The active container is shown in `sd-vpnc status`; it stops when the
+connection shell or SSH session exits.
+
+`--workdir`/`-C` mounts a host directory as `/work` inside the container. The
+option is the reliable way to choose a project directory; a container cannot
+change the current directory of its parent shell.
+
+## Runtime requirements
+
+- Podman or Docker
+- `/dev/net/tun` on the host
+- Permission to run containers with `NET_ADMIN`
+- An OpenVPN provider configuration
+
+The container runs with the invoking host UID/GID so files in the mounted work
+directory and SSH directory retain normal host ownership. The image itself is
+not built with a host-specific UID or GID.
+
+## Security
+
+The command grants the container `NET_ADMIN` and access to `/dev/net/tun`, which
+are required for OpenVPN. Only use configurations and images you trust.
+Provider configuration and credentials are bind-mounted read-only. Credentials
+are not copied into the image.
 
 ## Version and CI
 
-`sd-vpnc` follows SemVer and currently starts at `0.1.0`. The version is kept
-in the `VERSION` variable in the command script. GitHub Actions validates shell
-syntax, runs ShellCheck, and smoke-tests the help and version commands on pushes
-to `main` and pull requests.
+`sd-vpnc` follows SemVer and is currently at `0.2.4`. The version is kept in
+the `VERSION` variable in the executable. CI validates shell syntax, runs
+ShellCheck, and smoke-tests help and version output.
 
-## Security notes
+## Name
 
-- Treat the `.ovpn` file as a secret when it contains private keys or inline
-  credentials.
-- Grant `NET_ADMIN` and `/dev/net/tun` only to this VPN container.
-- Prefer SSH keys over password authentication.
-- The image normally runs as root because OpenVPN needs to configure the tunnel. The `run.sh` helper maps the container user to the invoking host user for mounted SSH files.
-
-## Structure
-
-```text
-Containerfile                 Image definition
-scripts/entrypoint.sh         Starts OpenVPN and handles optional SSH/tmux
-config/client.ovpn.example    Provider configuration template
-```
+The command is named `sd-vpnc` rather than `vpnc`. `vpnc` is already the widely
+used name of the Cisco-compatible VPN client, so `sd-vpnc` avoids shadowing an
+existing system command.
