@@ -45,6 +45,8 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # Admin PAT: lets the release commit bypass the main ruleset
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Configure Git
         run: |
