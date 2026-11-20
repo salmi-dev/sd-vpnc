@@ -61,6 +61,67 @@ The default paths are:
 individual configuration paths. The default paths are printed by `sd-vpnc
 --help` and `sd-vpnc status`.
 
+### Optional dotfiles repository
+
+An optional repository can seed the image's `/home/dev` during image build:
+
+```bash
+export SD_VPNC_DOTFILES=git@github.com:example/dotfiles.git
+export SD_VPNC_DOTFILES_REF=main   # optional branch, tag, or commit
+sd-vpnc image --rebuild
+```
+
+`SD_VPNC_DOTFILES` accepts repository URLs and paths understood by host Git,
+including local paths. Relative local paths are resolved from the directory
+where `sd-vpnc` is invoked. Empty values are treated as unset. A nonempty
+`SD_VPNC_DOTFILES_REF` without a nonempty repository is an error. When both
+are unset or empty, the current image build path is unchanged and Git is not
+required. Refs beginning with `-` are rejected rather than being interpreted
+as Git options. Host Git does not recursively initialize submodules, and
+clone/ref selection do not support interactive prompts.
+
+Host Git performs the clone and optional ref selection using its normal local
+configuration and authentication. For private repositories, configure a host
+credential helper or SSH agent that can authenticate without prompting. Host
+credential helpers and agents that operate noninteractively remain available;
+host credentials and agents are not forwarded into the image build. Askpass
+helpers are not supported: `sd-vpnc` disables `GIT_ASKPASS` and `SSH_ASKPASS`,
+disables terminal prompts, closes Git stdin, and requests SSH BatchMode. Do not
+embed tokens in repository URLs; `sd-vpnc` suppresses Git error output so the
+configured URL is not printed on clone/ref errors.
+
+For SSH URLs, command precedence is `GIT_SSH_COMMAND`, global `core.sshCommand`,
+system `core.sshCommand`, `GIT_SSH`, then the default `ssh`. Caller-project local
+`core.sshCommand` is ignored for the dotfiles fetch; use `GIT_SSH_COMMAND` for a
+per-invocation override. `sd-vpnc` appends `-o BatchMode=yes` to the chosen
+command so authentication cannot prompt. Custom SSH commands therefore need to
+accept OpenSSH-compatible `-o` options; `GIT_SSH` is treated as an executable
+path (including paths with spaces), not a command string. SSH config and
+agent-based authentication remain available.
+
+Configured builds use a unique temporary context beneath the cache root and
+remove that context after success or failure. Unconfigured builds retain the
+existing cache `sd-vpnc/build` context (under `XDG_CACHE_HOME` or `~/.cache`)
+and remove any stale dotfiles checkout there before building.
+
+The selected source is copied into the final image at
+`/home/dev/.dotfiles` without `.git` metadata. If the repository root contains
+`install.sh`, image creation runs it as root with Bash from
+`/home/dev/.dotfiles`, with `HOME=/home/dev` and stdin closed. The script must
+not expect input. A missing `install.sh` is a successful skip; no dotfiles are
+automatically linked. Installer-created symlinks into `.dotfiles`, files, and
+system changes persist in the image. Only tools already in the Fedora base
+image are available unless the installer adds more; Fedora package tooling
+may be used during the build.
+
+The repository itself remains in the image, so do not store secrets in it.
+The installer is arbitrary root code during image build. Dotfiles startup code
+may also run later at runtime with access to mounted SSH keys, VPN
+configuration and credentials, writable `/work`, and VPN connectivity. Only
+use a repository and ref you trust. Changes to repository contents or the
+selected ref do not update an existing image; rebuild with
+`sd-vpnc image --rebuild` after repository, ref, or content changes.
+
 ## Usage
 
 Initialize the configuration directory:
@@ -156,20 +217,61 @@ change the current directory of its parent shell.
 
 The container runs with the invoking host UID/GID so files in the mounted work
 directory and SSH directory retain normal host ownership. The image itself is
-not built with a host-specific UID or GID.
+not built with a host-specific UID or GID. `/work` is mounted from the host;
+the host's SSH directory is mounted read-only at `/home/dev/.ssh`, masking any
+image content at that path.
+
+When dotfiles are configured, `/home/dev` and `/home/dev/.dotfiles` are baked
+into the image and root-owned, not host-persisted, and not generally writable
+by the runtime host UID. File modes are preserved: a restrictive root-owned
+file such as mode `0600` may be unreadable by the runtime UID. Installers should
+create runtime-readable, non-secret configuration and must not rely on the
+feature changing ownership or permissions. No host UID/GID build arguments or
+permission rewrites are applied.
 
 ## Security
 
 The command grants the container `NET_ADMIN` and access to `/dev/net/tun`, which
-are required for OpenVPN. Only use configurations and images you trust.
-Provider configuration and credentials are bind-mounted read-only. Credentials
-are not copied into the image.
+are required for OpenVPN. Only use configurations, images, and dotfiles
+repositories you trust. The dotfiles installer executes arbitrary code as root
+at image-build time. Dotfiles startup code may execute at runtime and can then
+access the read-only mounted SSH directory, read-only VPN configuration and
+credentials, writable `/work`, and VPN connectivity. Do not store secrets in
+the dotfiles repository; its source is retained in the final image.
+
+The host `sd-vpnc` configuration directory (`$XDG_CONFIG_HOME/sd-vpnc`, or
+`~/.config/sd-vpnc` when `XDG_CONFIG_HOME` is unset) is mounted read-only at
+`/config` when the container runs. VPN credentials stored in that mounted
+directory are supplied through the mount and are not copied into the image.
+Host Git credentials and authentication agents are used only by host Git during
+image creation and are never forwarded into the build container.
+
+### Manual local-image validation
+
+In a disposable environment with a test repository, rebuild the image and
+check the following before relying on the setup:
+
+- Have `install.sh` create a symlink into `/home/dev/.dotfiles`; verify the
+  source remains in the final image and the symlink resolves there. Verify the
+  cloned `.git` metadata is absent and the temporary checkout is removed from
+  the host build context after both successful and failed builds.
+- Have the installer create a restrictive root-owned file (for example mode
+  `0600`); confirm its mode is preserved and that the runtime host UID may be
+  unable to read it. Use only runtime-readable, non-secret configuration for
+  normal operation.
+- Build once with no root `install.sh`; confirm the repository remains in the
+  image but no automatic links are created. Separately test a failing script
+  and a system-level change to confirm failure propagation and persistence.
+- At runtime, confirm the host's read-only SSH mount masks image content under
+  `/home/dev/.ssh` and that `/work` remains the mounted writable host directory.
 
 ## Version and CI/CD
 
 `sd-vpnc` follows SemVer. The version is kept in the `VERSION` variable in the
-executable. CI validates shell syntax, runs ShellCheck, and smoke-tests help,
-version, and agent guidance on pull requests and pushes to `main`.
+executable. CI validates shell syntax, runs ShellCheck, tests dotfiles image
+build behavior with fake Git/container commands and a local repository, and
+smoke-tests help, version, and agent guidance on pull requests and pushes to
+`main`. The behavior tests need no network access or Docker/Podman engine.
 
 After CI succeeds on a push to `main`, Auto Release creates a release commit
 that increments the patch version, pushes that commit, and creates a GitHub
