@@ -62,6 +62,7 @@ prepare_case() {
 	CONTAINERFILE_CAPTURE="$CASE_DIR/Containerfile"
 	GIT_LOG="$CASE_DIR/git.log"
 	CONTAINER_LOG="$CASE_DIR/container.log"
+	ENGINE_LOG="$CASE_DIR/engine.log"
 	mkdir -p "$FAKE_BIN" "$CASE_CACHE" "$CASE_HOME"
 	GIT_MODE=success
 	CONTAINER_MODE=success
@@ -76,12 +77,13 @@ prepare_case() {
 	FAKE_CALLER_SSH_COMMAND=
 	EXPECT_DOTFILES=no
 	EXPECT_SOURCE=
+	SENTINEL=
 	CONTAINER_DELAY=0
 	export CASE_DIR FAKE_BIN CASE_CACHE CASE_HOME CAPTURE_DIR
-	export CONTAINERFILE_CAPTURE GIT_LOG CONTAINER_LOG GIT_MODE CONTAINER_MODE
+	export CONTAINERFILE_CAPTURE GIT_LOG CONTAINER_LOG ENGINE_LOG GIT_MODE CONTAINER_MODE
 	export REPO_INSTALLER DOTFILES_TEST_URL SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF
 	export GIT_SSH_COMMAND GIT_SSH FAKE_CORE_SSH_COMMAND FAKE_SYSTEM_SSH_COMMAND FAKE_CALLER_SSH_COMMAND
-	export EXPECT_DOTFILES EXPECT_SOURCE CONTAINER_DELAY
+	export EXPECT_DOTFILES EXPECT_SOURCE SENTINEL CONTAINER_DELAY
 }
 
 run_sd() {
@@ -97,23 +99,36 @@ cat >"$TMP_ROOT/podman" <<'PODMAN'
 set -eu
 [ "${1:-}" = build ] || exit 90
 shift
+build_file=
 while [ "$#" -gt 0 ]; do
+	case $1 in
+		-f) build_file=${2:-}; shift ;;
+	esac
 	build_context=$1
 	shift
 done
+# Docker does not look for a Containerfile by default; both engines must be
+# told explicitly which generated file to build.
+[ "$build_file" = "$build_context/Containerfile" ] || exit 97
+printf '%s %s\n' "${0##*/}" "$build_context" >> "$ENGINE_LOG"
 printf '%s\n' "$build_context" >> "$CONTAINER_LOG"
 if [ "${CONTAINER_DELAY:-0}" -gt 0 ]; then
 	sleep "$CONTAINER_DELAY"
+fi
+if [ -n "${SENTINEL:-}" ] && grep -rqF -- "$SENTINEL" "$build_context/dotfiles-git" "$build_context/Containerfile"; then
+	exit 98
 fi
 cp "$build_context/Containerfile" "$CONTAINERFILE_CAPTURE"
 if [ "${EXPECT_DOTFILES:-no}" = yes ]; then
 	[ -d "$build_context/dotfiles" ] || exit 91
 	[ ! -e "$build_context/dotfiles/.git" ] || exit 92
+	[ -d "$build_context/dotfiles-git" ] || exit 96
 	if [ -n "${EXPECT_SOURCE:-}" ]; then
 		[ "$(cat "$build_context/dotfiles/.source")" = "$EXPECT_SOURCE" ] || exit 95
 	fi
 	mkdir -p "$CAPTURE_DIR"
 	cp -R "$build_context/dotfiles" "$CAPTURE_DIR/dotfiles"
+	cp -R "$build_context/dotfiles-git" "$CAPTURE_DIR/dotfiles-git"
 else
 	[ ! -e "$build_context/dotfiles" ] || exit 93
 fi
@@ -177,7 +192,9 @@ case ${1:-} in
 		checkout=${2:-}
 		[ -n "$repository" ] && [ -n "$checkout" ] || exit 82
 		mkdir -p "$checkout/.git"
-		printf '%s\n' "$repository" > "$checkout/.git/config"
+		printf '[remote "origin"]\n\turl = %s\n' "$repository" > "$checkout/.git/config"
+		mkdir -p "$checkout/.git/logs"
+		printf 'clone: from %s\n' "$repository" > "$checkout/.git/logs/HEAD"
 		printf '%s\n' "$repository" > "$checkout/.source"
 		printf 'dotfiles source\n' > "$checkout/.bashrc"
 		printf 'restrictive mode test\n' > "$checkout/.private-settings"
@@ -202,7 +219,13 @@ case ${1:-} in
 				fi
 				printf 'fake-selected-commit\n'
 				;;
-			remote) printf 'origin\n' ;;
+			remote)
+				if [ "${4:-}" = remove ]; then
+					printf '[core]\n\tbare = false\n' > "$checkout/.git/config"
+				else
+					printf 'origin\n'
+				fi
+				;;
 			checkout)
 				ref=${5:-}
 				printf 'checked-out-ref=%s\n' "$ref" >> "$GIT_LOG"
@@ -293,32 +316,49 @@ assert_not_contains "$output" "$SD_VPNC_DOTFILES"
 [ ! -e "$GIT_LOG" ] || fail "leading-dash ref was passed to Git"
 
 # The host Git receives the URL/ref noninteractively, and the engine sees a
-# checkout without .git. The checkout is removed after the build completes.
+# checkout without .git plus its Git metadata staged separately for a temporary
+# build-time mount. The checkout is removed after the build completes.
 prepare_case configured
 make_fake_path
-SD_VPNC_DOTFILES=https://token@example.invalid/dotfiles.git
+SENTINEL=sentinel-secret-token
+SD_VPNC_DOTFILES=https://$SENTINEL@example.invalid/dotfiles.git
 SD_VPNC_DOTFILES_REF=release-tag
 DOTFILES_TEST_URL=$SD_VPNC_DOTFILES
 EXPECT_DOTFILES=yes
-export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF DOTFILES_TEST_URL EXPECT_DOTFILES
+export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF DOTFILES_TEST_URL EXPECT_DOTFILES SENTINEL
 output=$(run_sd 2>&1) || fail "configured image build failed: $output"
-assert_contains "$(cat "$GIT_LOG")" "[https://token@example.invalid/dotfiles.git]"
+assert_contains "$(cat "$GIT_LOG")" "[https://sentinel-secret-token@example.invalid/dotfiles.git]"
+assert_contains "$(cat "$GIT_LOG")" '[remote][remove][origin]'
+assert_contains "$(cat "$ENGINE_LOG")" 'podman '
+# Host clone credentials must not reach the builder: the sentinel token is absent
+# from the staged Git metadata and the generated Containerfile (the fake engine
+# also checks the live build context). The fake clone writes its URL to a plain
+# worktree file, so only the Git metadata is scanned.
+if grep -rF -- "$SENTINEL" "$CAPTURE_DIR/dotfiles-git" "$CONTAINERFILE_CAPTURE" >/dev/null 2>&1; then
+	fail "host clone credentials reached the builder context"
+fi
+[ ! -e "$CAPTURE_DIR/dotfiles-git/logs" ] || fail "clone reflog reached the builder context"
 assert_contains "$(cat "$GIT_LOG")" 'release-tag'
 assert_contains "$(cat "$GIT_LOG")" 'GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never GIT_SSH_COMMAND=ssh -o BatchMode=yes GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never stdin=closed'
 assert_not_contains "$(cat "$GIT_LOG")" '--recurse-submodules'
 [ -f "$CAPTURE_DIR/dotfiles/.bashrc" ] || fail "repository source was not available to the image build"
-[ ! -e "$CAPTURE_DIR/dotfiles/.git" ] || fail ".git metadata reached the image build"
+[ ! -e "$CAPTURE_DIR/dotfiles/.git" ] || fail ".git metadata reached the copied source tree"
+[ -f "$CAPTURE_DIR/dotfiles-git/config" ] || fail "Git metadata was not staged for the installer mount"
 [ -x "$CAPTURE_DIR/dotfiles/install.sh" ] || fail "installer file mode was not preserved"
 [ "$(file_mode "$CAPTURE_DIR/dotfiles/.private-settings")" = 600 ] || fail "restrictive file mode was not preserved"
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY dotfiles /home/dev/.dotfiles'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /home/dev/.dotfiles'
-assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN --mount=type=bind,source=dotfiles-git,target=/home/dev/.dotfiles/.git,z if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN rm -rf /home/dev/.dotfiles/.git'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /work'
+# The metadata is only ever bind-mounted; no instruction may copy it into a layer.
+assert_not_contains "$(grep -E '^(COPY|ADD) ' "$CONTAINERFILE_CAPTURE")" 'dotfiles-git'
+assert_not_contains "$(grep -E '^(COPY|ADD) ' "$CONTAINERFILE_CAPTURE")" '.git'
 [ "$(grep -c '^FROM ' "$CONTAINERFILE_CAPTURE")" -eq 1 ] || fail "dotfiles setup unexpectedly uses a disposable image stage"
 DOTFILES_CONTAINERFILE=$(sed -n '/^COPY dotfiles /,$p' "$CONTAINERFILE_CAPTURE")
 assert_not_contains "$DOTFILES_CONTAINERFILE" 'chmod'
 assert_not_contains "$DOTFILES_CONTAINERFILE" 'chown'
-INSTALLER_RUN_LINE=$(sed -n 's/^RUN //p' "$CONTAINERFILE_CAPTURE" | grep -F 'bash ./install.sh' | tail -n 1)
+INSTALLER_RUN_LINE=$(sed -n 's/^RUN //p' "$CONTAINERFILE_CAPTURE" | grep -F 'bash ./install.sh' | tail -n 1 | sed 's/^--mount=[^ ]* //')
 [ -n "$INSTALLER_RUN_LINE" ] || fail "could not locate generated installer command"
 INSTALLER_DIR="$CASE_DIR/installer-success"
 INSTALLER_RESULT="$CASE_DIR/installer-result"
@@ -333,6 +373,26 @@ printf 'installer ran noninteractively\n' > "$INSTALLER_RESULT"
 INSTALLER
 (cd "$INSTALLER_DIR" && sh -c "$INSTALLER_RUN_LINE") || fail "successful installer command failed"
 [ -f "$INSTALLER_RESULT" ] || fail "installer did not receive expected HOME/cwd/closed stdin"
+# Regression (#5): an installer that requires a Git checkout succeeds when the
+# staged metadata is mounted at .git, as the generated RUN --mount does, and the
+# mount point is gone afterward. Without the metadata the same installer fails.
+INSTALLER_DIR="$CASE_DIR/installer-git-checkout"
+INSTALLER_RESULT="$CASE_DIR/installer-git-result"
+export INSTALLER_DIR INSTALLER_RESULT
+mkdir -p "$INSTALLER_DIR"
+cat >"$INSTALLER_DIR/install.sh" <<'INSTALLER'
+[ -f .git/config ] || { echo "$PWD is not a git checkout of the dotfiles." >&2; exit 41; }
+printf 'installer saw checkout\n' > "$INSTALLER_RESULT"
+INSTALLER
+if (cd "$INSTALLER_DIR" && sh -c "$INSTALLER_RUN_LINE") 2>/dev/null; then
+	fail "git-checkout installer unexpectedly succeeded without Git metadata"
+fi
+cp -R "$CAPTURE_DIR/dotfiles-git" "$INSTALLER_DIR/.git"
+(cd "$INSTALLER_DIR" && sh -c "$INSTALLER_RUN_LINE") || fail "git-checkout installer failed with Git metadata mounted"
+[ -f "$INSTALLER_RESULT" ] || fail "git-checkout installer effects were not produced"
+RM_LINE=$(sed -n 's/^RUN //p' "$CONTAINERFILE_CAPTURE" | grep -F 'rm -rf /home/dev/.dotfiles/.git')
+[ -n "$RM_LINE" ] || fail "could not locate mount point removal command"
+[ "$(printf '%s\n' "$RM_LINE" | wc -l)" -eq 1 ] || fail "unexpected mount point removal commands"
 INSTALLER_DIR="$CASE_DIR/installer-missing"
 export INSTALLER_DIR
 mkdir -p "$INSTALLER_DIR"
@@ -556,7 +616,8 @@ assert_no_configured_contexts
 # repository when host Git is available; this never accesses the network.
 if [ -n "$ORIGINAL_GIT" ]; then
 	prepare_case local-git-refs
-	LOCAL_REPO="$CASE_DIR/local repository"
+	SENTINEL=sentinel-secret-token
+	LOCAL_REPO="$CASE_DIR/local $SENTINEL repository"
 	mkdir -p "$LOCAL_REPO"
 	"$ORIGINAL_GIT" -C "$LOCAL_REPO" init -q
 	"$ORIGINAL_GIT" -C "$LOCAL_REPO" config user.name dotfiles-test
@@ -579,36 +640,131 @@ if [ -n "$ORIGINAL_GIT" ]; then
 	cp "$TMP_ROOT/podman" "$FAKE_BIN/podman"
 	chmod +x "$FAKE_BIN/podman"
 	RUN_PATH="$FAKE_BIN:$ORIGINAL_PATH"
-	export RUN_PATH LOCAL_REPO
+	export RUN_PATH LOCAL_REPO SENTINEL
 	run_local_git_ref() {
 		ref_label=$1
 		ref_name=$2
 		expected_selection=$3
+		expected_commit=$("$ORIGINAL_GIT" -C "$LOCAL_REPO" rev-parse "$ref_name^{commit}")
 		CASE_CACHE="$CASE_DIR/cache-$ref_label"
 		CASE_HOME="$CASE_DIR/home-$ref_label"
 		CAPTURE_DIR="$CASE_DIR/capture-$ref_label"
 		CONTAINERFILE_CAPTURE="$CASE_DIR/$ref_label.Containerfile"
 		GIT_LOG="$CASE_DIR/$ref_label.git.log"
 		CONTAINER_LOG="$CASE_DIR/$ref_label.container.log"
+		ENGINE_LOG="$CASE_DIR/$ref_label.engine.log"
 		SD_VPNC_DOTFILES=$LOCAL_REPO
 		SD_VPNC_DOTFILES_REF=$ref_name
 		EXPECT_DOTFILES=yes
 		EXPECT_SOURCE=$expected_selection
 		mkdir -p "$CASE_HOME"
-		export CASE_CACHE CASE_HOME CAPTURE_DIR CONTAINERFILE_CAPTURE GIT_LOG CONTAINER_LOG
+		export CASE_CACHE CASE_HOME CAPTURE_DIR CONTAINERFILE_CAPTURE GIT_LOG CONTAINER_LOG ENGINE_LOG
 		export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF EXPECT_DOTFILES EXPECT_SOURCE
 		output=$(run_sd 2>&1) || fail "real local Git $ref_label build failed: $output"
 		[ "$(cat "$CAPTURE_DIR/dotfiles/.selection")" = "$expected_selection" ] || fail "real Git selected the wrong $ref_label state"
-		[ ! -e "$CAPTURE_DIR/dotfiles/.git" ] || fail "real Git metadata reached the build context"
+		[ ! -e "$CAPTURE_DIR/dotfiles/.git" ] || fail "real Git metadata reached the copied source tree"
+		[ -f "$CAPTURE_DIR/dotfiles-git/HEAD" ] || fail "real Git metadata was not staged for the installer mount"
+		mounted_checkout="$CASE_DIR/mounted-$ref_label"
+		mkdir -p "$mounted_checkout"
+		cp -R "$CAPTURE_DIR/dotfiles/." "$mounted_checkout"
+		cp -R "$CAPTURE_DIR/dotfiles-git" "$mounted_checkout/.git"
+		if grep -rF -- "$SENTINEL" "$CAPTURE_DIR/dotfiles-git" "$CASE_DIR/$ref_label.Containerfile" >/dev/null 2>&1; then
+			fail "host clone source reached the builder context for $ref_label"
+		fi
+		[ ! -e "$CAPTURE_DIR/dotfiles-git/logs" ] || fail "clone reflog reached the builder context for $ref_label"
+		[ -z "$("$ORIGINAL_GIT" -C "$mounted_checkout" remote)" ] || fail "remote reached the builder context for $ref_label"
+		# Run the generated installer command in the mounted checkout; the installer
+		# verifies real Git checkout identity and the selected commit.
+		cat >"$mounted_checkout/install.sh" <<'INSTALLER'
+[ "$("$TEST_GIT" rev-parse --is-inside-work-tree)" = true ] || exit 51
+[ "$("$TEST_GIT" rev-parse HEAD)" = "$EXPECTED_COMMIT" ] || exit 52
+printf 'checkout verified\n' > "$INSTALLER_RESULT"
+INSTALLER
+		ref_run_line=$(sed -n 's/^RUN //p' "$CASE_DIR/$ref_label.Containerfile" | grep -F 'bash ./install.sh' | tail -n 1 | sed 's/^--mount=[^ ]* //')
+		INSTALLER_RESULT="$CASE_DIR/$ref_label.installer-result"
+		TEST_GIT=$ORIGINAL_GIT
+		EXPECTED_COMMIT=$expected_commit
+		export INSTALLER_RESULT TEST_GIT EXPECTED_COMMIT
+		(cd "$mounted_checkout" && sh -c "$ref_run_line") || fail "installer could not verify the $ref_label Git checkout and selected commit"
+		[ -f "$INSTALLER_RESULT" ] || fail "installer checkout verification did not complete for $ref_label"
 		assert_logged_context_removed
 		assert_no_configured_contexts
 	}
 	run_local_git_ref branch feature branch-ref
 	run_local_git_ref tag selected-tag tag-ref
 	run_local_git_ref commit "$LOCAL_COMMIT" commit-ref
+
+	# A source repository that borrows objects through alternates yields a local
+	# clone that also depends on the host path. The staged metadata must keep the
+	# selected commit and its reachable history once the original objects are
+	# unavailable; unreachable objects are intentionally not asserted.
+	prepare_case local-git-alternates
+	cp "$TMP_ROOT/podman" "$FAKE_BIN/podman"
+	chmod +x "$FAKE_BIN/podman"
+	RUN_PATH="$FAKE_BIN:$ORIGINAL_PATH"
+	ALT_BASE="$CASE_DIR/alternates-base"
+	ALT_SOURCE="$CASE_DIR/alternates-source"
+	mkdir -p "$ALT_BASE"
+	"$ORIGINAL_GIT" -C "$ALT_BASE" init -q
+	"$ORIGINAL_GIT" -C "$ALT_BASE" config user.name dotfiles-test
+	"$ORIGINAL_GIT" -C "$ALT_BASE" config user.email dotfiles-test@example.invalid
+	printf 'base\n' > "$ALT_BASE/.source"
+	"$ORIGINAL_GIT" -C "$ALT_BASE" add .source
+	"$ORIGINAL_GIT" -C "$ALT_BASE" commit -qm base
+	"$ORIGINAL_GIT" clone -q --shared "$ALT_BASE" "$ALT_SOURCE"
+	"$ORIGINAL_GIT" -C "$ALT_SOURCE" config user.name dotfiles-test
+	"$ORIGINAL_GIT" -C "$ALT_SOURCE" config user.email dotfiles-test@example.invalid
+	[ -e "$ALT_SOURCE/.git/objects/info/alternates" ] || fail "alternates fixture was not created"
+	"$ORIGINAL_GIT" clone -q -- "$ALT_SOURCE" "$CASE_DIR/alternates-control"
+	[ -e "$CASE_DIR/alternates-control/.git/objects/info/alternates" ] || fail "alternates fixture does not reproduce a host-dependent clone"
+	printf 'tip\n' > "$ALT_SOURCE/.source"
+	"$ORIGINAL_GIT" -C "$ALT_SOURCE" commit -qam tip
+	ALT_COMMIT=$("$ORIGINAL_GIT" -C "$ALT_SOURCE" rev-parse HEAD)
+	SD_VPNC_DOTFILES=$ALT_SOURCE
+	EXPECT_DOTFILES=yes
+	export RUN_PATH SD_VPNC_DOTFILES EXPECT_DOTFILES
+	output=$(run_sd 2>&1) || fail "alternates-backed local Git build failed: $output"
+	[ ! -e "$CAPTURE_DIR/dotfiles-git/objects/info/alternates" ] || fail "staged Git metadata still depends on alternates"
+	mv "$ALT_BASE" "$CASE_DIR/alternates-base.gone"
+	mv "$ALT_SOURCE" "$CASE_DIR/alternates-source.gone"
+	mounted_checkout="$CASE_DIR/mounted-alternates"
+	mkdir -p "$mounted_checkout"
+	cp -R "$CAPTURE_DIR/dotfiles/." "$mounted_checkout"
+	cp -R "$CAPTURE_DIR/dotfiles-git" "$mounted_checkout/.git"
+	[ "$("$ORIGINAL_GIT" -C "$mounted_checkout" rev-parse HEAD)" = "$ALT_COMMIT" ] || fail "alternates-backed checkout selected the wrong commit"
+	"$ORIGINAL_GIT" -C "$mounted_checkout" fsck --full >/dev/null 2>&1 || fail "staged Git metadata lost reachable history without the original repositories"
+	[ "$("$ORIGINAL_GIT" -C "$mounted_checkout" rev-list --count HEAD)" = 2 ] || fail "staged Git history is incomplete"
+	"$ORIGINAL_GIT" -C "$mounted_checkout" rev-list --objects --all >/dev/null 2>&1 || fail "staged Git reachable objects are incomplete"
+	assert_logged_context_removed
+	assert_no_configured_contexts
+
 else
 	printf 'Skipping local Git ref test: host Git is unavailable.\n'
 fi
+
+# Docker needs the generated Containerfile named explicitly and the build runs
+# through the docker command when podman is absent.
+prepare_case docker-engine
+DOCKER_BIN="$CASE_DIR/docker-bin"
+mkdir -p "$DOCKER_BIN"
+for utility in cat chmod cp id mkdir mktemp rm mv sed grep; do
+	utility_path=$(command -v "$utility") || fail "missing utility: $utility"
+	ln -s "$utility_path" "$DOCKER_BIN/$utility"
+done
+cp "$TMP_ROOT/podman" "$DOCKER_BIN/docker"
+cp "$TMP_ROOT/git" "$DOCKER_BIN/git"
+chmod +x "$DOCKER_BIN/docker" "$DOCKER_BIN/git"
+[ ! -e "$DOCKER_BIN/podman" ] || fail "docker path unexpectedly contains podman"
+RUN_PATH=$DOCKER_BIN
+SD_VPNC_DOTFILES=docker-engine-repo
+EXPECT_DOTFILES=yes
+export RUN_PATH SD_VPNC_DOTFILES EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "docker image build failed: $output"
+assert_contains "$(cat "$ENGINE_LOG")" 'docker '
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN --mount=type=bind,source=dotfiles-git,target=/home/dev/.dotfiles/.git if [ -f ./install.sh ]'
+assert_not_contains "$(cat "$CONTAINERFILE_CAPTURE")" ',z'
+assert_logged_context_removed
+assert_no_configured_contexts
 
 # If no installer is present, the source is still copied and the Containerfile
 # conditionally skips the install command rather than auto-linking files.

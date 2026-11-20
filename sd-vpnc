@@ -188,8 +188,24 @@ build_image() (
 				die "Failed to select the configured dotfiles ref."
 			fi
 		fi
-		if ! rm -rf "$checkout_dir/.git"; then
-			die "Failed to remove Git metadata from the dotfiles repository."
+		# The installer sees only a self-contained checkout: no remote URL or
+		# credentials, no clone reflog naming the source, and no references to
+		# host repositories through alternates for the selected commit and its
+		# reachable history (unreachable objects are not guaranteed).
+		git_metadata_dir="$checkout_dir/.git"
+		remote_names=$(git -C "$checkout_dir" remote 2>/dev/null) || die "Failed to sanitize Git metadata from the dotfiles repository."
+		for remote_name in $remote_names; do
+			git -C "$checkout_dir" remote remove "$remote_name" >/dev/null 2>&1 || die "Failed to sanitize Git metadata from the dotfiles repository."
+		done
+		if ! rm -rf "$git_metadata_dir/logs" "$git_metadata_dir/FETCH_HEAD" "$git_metadata_dir/ORIG_HEAD"; then
+			die "Failed to sanitize Git metadata from the dotfiles repository."
+		fi
+		if [ -e "$git_metadata_dir/objects/info/alternates" ] || [ -e "$git_metadata_dir/objects/info/http-alternates" ]; then
+			git -C "$checkout_dir" repack -a -d -q </dev/null >/dev/null 2>&1 || die "Failed to make Git metadata self-contained."
+			rm -f "$git_metadata_dir/objects/info/alternates" "$git_metadata_dir/objects/info/http-alternates" || die "Failed to make Git metadata self-contained."
+		fi
+		if ! mv "$git_metadata_dir" "$build_dir/dotfiles-git"; then
+			die "Failed to separate Git metadata from the dotfiles repository."
 		fi
 	else
 		build_dir="$build_root/build"
@@ -399,16 +415,23 @@ esac
 ENTRYPOINT
 
 	if [ -n "$dotfiles_repo" ]; then
-		cat >>"$build_dir/Containerfile" <<'DOTFILES'
-COPY dotfiles /home/dev/.dotfiles
-WORKDIR /home/dev/.dotfiles
-RUN if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi
-WORKDIR /work
-DOTFILES
+		# Podman needs the relabel option so SELinux hosts let the installer read
+		# the mounted metadata; BuildKit (Docker) rejects it.
+		git_mount_options=
+		if [ "$container_command" = podman ]; then
+			git_mount_options=,z
+		fi
+		{
+			printf '%s\n' 'COPY dotfiles /home/dev/.dotfiles'
+			printf '%s\n' 'WORKDIR /home/dev/.dotfiles'
+			printf '%s\n' "RUN --mount=type=bind,source=dotfiles-git,target=/home/dev/.dotfiles/.git$git_mount_options if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi"
+			printf '%s\n' 'RUN rm -rf /home/dev/.dotfiles/.git'
+			printf '%s\n' 'WORKDIR /work'
+		} >>"$build_dir/Containerfile"
 	fi
 
 	printf '%s\n' "Building $IMAGE ..." >&2
-	"$container_command" build -t "$IMAGE" "$build_dir"
+	"$container_command" build -f "$build_dir/Containerfile" -t "$IMAGE" "$build_dir"
 )
 
 workdir=${XDG_DATA_HOME:-"$HOME/.local/share"}/sd-vpnc

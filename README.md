@@ -108,9 +108,28 @@ The selected source is copied into the final image at
 `/home/dev/.dotfiles` without `.git` metadata. If the repository root contains
 `install.sh`, image creation runs it as root with Bash from
 `/home/dev/.dotfiles`, with `HOME=/home/dev` and stdin closed. The script must
-not expect input. A missing `install.sh` is a successful skip; no dotfiles are
-automatically linked. Installer-created symlinks into `.dotfiles`, files, and
-system changes persist in the image. Only tools already in the Fedora base
+not expect input. While it runs, a sanitized copy of the checkout's Git
+metadata is bind-mounted read-only at `/home/dev/.dotfiles/.git`, so the
+installer can verify it runs from a Git checkout (for example with `git
+rev-parse --is-inside-work-tree` and `git rev-parse HEAD`, if it installs Git
+first; the base image has none). The mounted metadata has no remote, so the
+clone URL and any credentials embedded in it are not exposed, and no clone
+reflog; for the selected commit and its reachable history, objects borrowed from
+a source repository's alternates are copied in so they do not depend on host
+paths (unreachable objects are not guaranteed to be preserved). `sd-vpnc` does not commit the
+mounted metadata to an image layer and removes any `.git` mount point, so
+`/home/dev/.dotfiles/.git` does not exist in the final image. This describes
+what `sd-vpnc` adds to the image: an installer runs arbitrary root code and could
+still copy the mounted data elsewhere. The build uses `RUN --mount=type=bind`, so
+the engine must support it. This was verified with Podman (which `sd-vpnc` mounts
+with the `z` relabel option so SELinux hosts allow the read); Docker with
+BuildKit is passed `-f` for the generated `Containerfile` and is not
+relabeled, but Docker was not run against a real daemon here, and Git's
+`safe.directory` ownership check may affect installer Git commands there. The
+installer still sees the repository's committed history and objects, so do not
+store secrets in it. A missing `install.sh` is a successful skip; no dotfiles
+are automatically linked. Installer-created symlinks into `.dotfiles`, files,
+and system changes persist in the image. Only tools already in the Fedora base
 image are available unless the installer adds more; Fedora package tooling
 may be used during the build.
 
@@ -252,9 +271,10 @@ In a disposable environment with a test repository, rebuild the image and
 check the following before relying on the setup:
 
 - Have `install.sh` create a symlink into `/home/dev/.dotfiles`; verify the
-  source remains in the final image and the symlink resolves there. Verify the
-  cloned `.git` metadata is absent and the temporary checkout is removed from
-  the host build context after both successful and failed builds.
+  source remains in the final image and the symlink resolves there. Verify an
+  installer that requires a Git checkout succeeds, that `.git` is absent from
+  the final image, and that the temporary checkout is removed from the host
+  build context after both successful and failed builds.
 - Have the installer create a restrictive root-owned file (for example mode
   `0600`); confirm its mode is preserved and that the runtime host UID may be
   unable to read it. Use only runtime-readable, non-secret configuration for
@@ -271,7 +291,10 @@ check the following before relying on the setup:
 executable. CI validates shell syntax, runs ShellCheck, tests dotfiles image
 build behavior with fake Git/container commands and a local repository, and
 smoke-tests help, version, and agent guidance on pull requests and pushes to
-`main`. The behavior tests need no network access or Docker/Podman engine.
+`main`. The behavior tests need no network access or Docker/Podman engine; they
+check the generated Containerfile and engine arguments (including the explicit
+`-f` Docker needs) against fake engines, so real-engine builds remain a manual
+check.
 
 After CI succeeds on a push to `main`, Auto Release creates a release commit
 that increments the patch version, pushes that commit, and creates a GitHub
