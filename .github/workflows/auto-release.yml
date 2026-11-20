@@ -35,7 +35,7 @@ jobs:
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.event == 'push' &&
         github.event.workflow_run.head_branch == 'main' &&
-        !startsWith(github.event.workflow_run.display_title, 'chore(release):')
+        !startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
       )
     runs-on: ubuntu-latest
 
@@ -111,7 +111,8 @@ jobs:
           perl -0pi -e "s/^VERSION=\\Q$version\\E$/VERSION=$next/m" sd-vpnc
 
           git add sd-vpnc
-          git commit -m "chore(release): $tag"
+          # Release commits must not retrigger CI and start another release cycle.
+          git commit -m "chore(release): $tag [skip ci]"
           release_sha=$(git rev-parse HEAD)
 
           git push origin HEAD:main
