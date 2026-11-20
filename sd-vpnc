@@ -3,7 +3,7 @@
 set -eu
 
 PROGRAM=${0##*/}
-VERSION=0.2.17
+VERSION=0.2.18
 IMAGE="localhost/sd-vpnc:$VERSION"
 CONTAINER_NAME="sd-vpnc-$(id -u)"
 TUN_CONTAINER_NAME="sd-vpnc-tun-$(id -u)"
