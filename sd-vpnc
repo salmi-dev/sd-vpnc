@@ -113,10 +113,89 @@ need_dir() {
 
 container_command=
 
-build_image() {
+quote_shell_argument() {
+	quoted_value=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+	printf "'%s'" "$quoted_value"
+}
+
+build_image() (
+	dotfiles_repo=${SD_VPNC_DOTFILES:-}
+	dotfiles_ref=${SD_VPNC_DOTFILES_REF:-}
+	if [ -z "$dotfiles_repo" ] && [ -n "$dotfiles_ref" ]; then
+		die "SD_VPNC_DOTFILES_REF requires SD_VPNC_DOTFILES."
+	fi
+	case $dotfiles_ref in
+		-*) die "SD_VPNC_DOTFILES_REF must not start with '-'." ;;
+	esac
+
 	cache_home=${XDG_CACHE_HOME:-"$HOME/.cache"}
-	build_dir="$cache_home/sd-vpnc/build"
-	mkdir -p "$build_dir"
+	build_root="$cache_home/sd-vpnc"
+	mkdir -p "$build_root"
+	if [ -n "$dotfiles_repo" ]; then
+		build_dir=$(mktemp -d "$build_root/build.XXXXXX") || die "Failed to create the image build context."
+		trap 'rm -rf "$build_dir"' 0
+		trap 'exit 1' HUP INT TERM
+		checkout_dir="$build_dir/dotfiles"
+		command -v git >/dev/null 2>&1 || die "Git is required to clone the configured dotfiles repository."
+		if [ -n "${GIT_SSH_COMMAND:-}" ]; then
+			git_ssh_command="$GIT_SSH_COMMAND"
+		else
+			if core_ssh_command=$(git config --global --get core.sshCommand 2>/dev/null); then
+				:
+			elif core_ssh_command=$(git config --system --get core.sshCommand 2>/dev/null); then
+				:
+			else
+				core_ssh_command=
+			fi
+			if [ -n "$core_ssh_command" ]; then
+				git_ssh_command="$core_ssh_command"
+			elif [ -n "${GIT_SSH:-}" ]; then
+				git_ssh_command=$(quote_shell_argument "$GIT_SSH")
+			else
+				git_ssh_command=ssh
+			fi
+		fi
+		git_ssh_command="$git_ssh_command -o BatchMode=yes"
+		if ! GIT_SSH_COMMAND="$git_ssh_command" GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git -c submodule.recurse=false clone -- "$dotfiles_repo" "$checkout_dir" </dev/null >/dev/null 2>&1; then
+			die "Failed to clone the configured dotfiles repository."
+		fi
+		if [ -n "$dotfiles_ref" ]; then
+			dotfiles_commit=
+			for ref_namespace in heads tags; do
+				if dotfiles_commit=$(git -C "$checkout_dir" rev-parse --verify "refs/$ref_namespace/$dotfiles_ref^{commit}" 2>/dev/null); then
+					break
+				fi
+			done
+			if [ -z "$dotfiles_commit" ]; then
+				remote_names=$(git -C "$checkout_dir" remote 2>/dev/null || true)
+				old_ifs=$IFS
+				IFS='
+'
+				case $- in *f*) glob_was_disabled=1 ;; *) glob_was_disabled=0 ;; esac
+				set -f
+				for remote_name in $remote_names; do
+					if dotfiles_commit=$(git -C "$checkout_dir" rev-parse --verify "refs/remotes/$remote_name/$dotfiles_ref^{commit}" 2>/dev/null); then
+						break
+					fi
+				done
+				IFS=$old_ifs
+				[ "$glob_was_disabled" = 1 ] || set +f
+			fi
+			if [ -z "$dotfiles_commit" ]; then
+				dotfiles_commit=$(git -C "$checkout_dir" rev-parse --verify "$dotfiles_ref^{commit}" 2>/dev/null) || die "Failed to select the configured dotfiles ref."
+			fi
+			if ! GIT_SSH_COMMAND="$git_ssh_command" GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git -c submodule.recurse=false -C "$checkout_dir" checkout --detach "$dotfiles_commit" </dev/null >/dev/null 2>&1; then
+				die "Failed to select the configured dotfiles ref."
+			fi
+		fi
+		if ! rm -rf "$checkout_dir/.git"; then
+			die "Failed to remove Git metadata from the dotfiles repository."
+		fi
+	else
+		build_dir="$build_root/build"
+		rm -rf "$build_dir/dotfiles"
+		mkdir -p "$build_dir"
+	fi
 
 	cat >"$build_dir/Containerfile" <<'CONTAINERFILE'
 FROM fedora:42
@@ -319,9 +398,18 @@ case "$mode" in
 esac
 ENTRYPOINT
 
+	if [ -n "$dotfiles_repo" ]; then
+		cat >>"$build_dir/Containerfile" <<'DOTFILES'
+COPY dotfiles /home/dev/.dotfiles
+WORKDIR /home/dev/.dotfiles
+RUN if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi
+WORKDIR /work
+DOTFILES
+	fi
+
 	printf '%s\n' "Building $IMAGE ..." >&2
 	"$container_command" build -t "$IMAGE" "$build_dir"
-}
+)
 
 workdir=${XDG_DATA_HOME:-"$HOME/.local/share"}/sd-vpnc
 config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/sd-vpnc

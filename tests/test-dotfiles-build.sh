@@ -1,0 +1,629 @@
+#!/bin/sh
+
+set -eu
+
+REPO_ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
+ORIGINAL_PATH=$PATH
+ORIGINAL_GIT=$(command -v git || true)
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
+TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/sd-vpnc-dotfiles.XXXXXX")
+trap 'rm -rf "$TMP_ROOT"' 0
+trap 'exit 1' HUP INT TERM
+
+fail() {
+	printf 'FAIL: %s\n' "$*" >&2
+	exit 1
+}
+
+assert_contains() {
+	case $1 in
+		*"$2"*) ;;
+		*) fail "expected text to contain: $2" ;;
+	esac
+}
+
+assert_not_contains() {
+	case $1 in
+		*"$2"*) fail "expected text not to contain: $2" ;;
+		*) ;;
+	esac
+}
+
+file_mode() {
+	stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+assert_file_contains() {
+	file=$1
+	text=$2
+	grep -F "$text" "$file" >/dev/null || fail "$file does not contain: $text"
+}
+
+assert_no_configured_contexts() {
+	for context in "$CASE_CACHE"/sd-vpnc/build.*; do
+		[ ! -e "$context" ] || fail "configured build context was not removed: $context"
+	done
+}
+
+assert_logged_context_removed() {
+	context=$(cat "$CONTAINER_LOG")
+	[ ! -e "$context" ] || fail "configured build context was not removed: $context"
+}
+
+prepare_case() {
+	case_name=$1
+	CASE_DIR="$TMP_ROOT/$case_name"
+	FAKE_BIN="$CASE_DIR/bin"
+	CASE_CACHE="$CASE_DIR/cache"
+	CASE_HOME="$CASE_DIR/home"
+	CAPTURE_DIR="$CASE_DIR/captured"
+	CONTAINERFILE_CAPTURE="$CASE_DIR/Containerfile"
+	GIT_LOG="$CASE_DIR/git.log"
+	CONTAINER_LOG="$CASE_DIR/container.log"
+	mkdir -p "$FAKE_BIN" "$CASE_CACHE" "$CASE_HOME"
+	GIT_MODE=success
+	CONTAINER_MODE=success
+	REPO_INSTALLER=yes
+	DOTFILES_TEST_URL=
+	SD_VPNC_DOTFILES=
+	SD_VPNC_DOTFILES_REF=
+	GIT_SSH_COMMAND=
+	GIT_SSH=
+	FAKE_CORE_SSH_COMMAND=
+	FAKE_SYSTEM_SSH_COMMAND=
+	FAKE_CALLER_SSH_COMMAND=
+	EXPECT_DOTFILES=no
+	EXPECT_SOURCE=
+	CONTAINER_DELAY=0
+	export CASE_DIR FAKE_BIN CASE_CACHE CASE_HOME CAPTURE_DIR
+	export CONTAINERFILE_CAPTURE GIT_LOG CONTAINER_LOG GIT_MODE CONTAINER_MODE
+	export REPO_INSTALLER DOTFILES_TEST_URL SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF
+	export GIT_SSH_COMMAND GIT_SSH FAKE_CORE_SSH_COMMAND FAKE_SYSTEM_SSH_COMMAND FAKE_CALLER_SSH_COMMAND
+	export EXPECT_DOTFILES EXPECT_SOURCE CONTAINER_DELAY
+}
+
+run_sd() {
+	PATH="$RUN_PATH" \
+	HOME="$CASE_HOME" \
+	XDG_CACHE_HOME="$CASE_CACHE" \
+	SD_VPNC_COLOR=never \
+		"$REPO_ROOT/sd-vpnc" image --rebuild
+}
+
+cat >"$TMP_ROOT/podman" <<'PODMAN'
+#!/bin/sh
+set -eu
+[ "${1:-}" = build ] || exit 90
+shift
+while [ "$#" -gt 0 ]; do
+	build_context=$1
+	shift
+done
+printf '%s\n' "$build_context" >> "$CONTAINER_LOG"
+if [ "${CONTAINER_DELAY:-0}" -gt 0 ]; then
+	sleep "$CONTAINER_DELAY"
+fi
+cp "$build_context/Containerfile" "$CONTAINERFILE_CAPTURE"
+if [ "${EXPECT_DOTFILES:-no}" = yes ]; then
+	[ -d "$build_context/dotfiles" ] || exit 91
+	[ ! -e "$build_context/dotfiles/.git" ] || exit 92
+	if [ -n "${EXPECT_SOURCE:-}" ]; then
+		[ "$(cat "$build_context/dotfiles/.source")" = "$EXPECT_SOURCE" ] || exit 95
+	fi
+	mkdir -p "$CAPTURE_DIR"
+	cp -R "$build_context/dotfiles" "$CAPTURE_DIR/dotfiles"
+else
+	[ ! -e "$build_context/dotfiles" ] || exit 93
+fi
+[ "${CONTAINER_MODE:-success}" = success ] || exit 94
+PODMAN
+chmod +x "$TMP_ROOT/podman"
+
+cat >"$TMP_ROOT/git" <<'GIT'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = config ]; then
+	case ${2:-} in
+		--global)
+			printf 'config-scope=global\n' >> "$GIT_LOG"
+			if [ -n "${FAKE_CORE_SSH_COMMAND:-}" ]; then
+				printf '%s\n' "$FAKE_CORE_SSH_COMMAND"
+				exit 0
+			fi
+			exit 1
+			;;
+		--system)
+			printf 'config-scope=system\n' >> "$GIT_LOG"
+			if [ -n "${FAKE_SYSTEM_SSH_COMMAND:-}" ]; then
+				printf '%s\n' "$FAKE_SYSTEM_SSH_COMMAND"
+				exit 0
+			fi
+			exit 1
+			;;
+		--get)
+			printf 'config-scope=local\n' >> "$GIT_LOG"
+			if [ -n "${FAKE_CALLER_SSH_COMMAND:-}" ]; then
+				printf '%s\n' "$FAKE_CALLER_SSH_COMMAND"
+				exit 0
+			fi
+			exit 1
+			;;
+		*) exit 87 ;;
+	esac
+fi
+if read -r prompt_line; then
+	stdin_state=open
+else
+	stdin_state=closed
+fi
+printf 'GIT_TERMINAL_PROMPT=%s GCM_INTERACTIVE=%s GIT_SSH_COMMAND=%s GIT_ASKPASS=%s SSH_ASKPASS=%s SSH_ASKPASS_REQUIRE=%s stdin=%s cwd=%s argv=' \
+	"${GIT_TERMINAL_PROMPT:-}" "${GCM_INTERACTIVE:-}" "${GIT_SSH_COMMAND:-}" "${GIT_ASKPASS:-}" "${SSH_ASKPASS:-}" "${SSH_ASKPASS_REQUIRE:-}" "$stdin_state" "$PWD" >> "$GIT_LOG"
+for argument do
+	printf '[%s]' "$argument" >> "$GIT_LOG"
+done
+printf '\n' >> "$GIT_LOG"
+if [ "${1:-}" = -c ]; then
+	[ "${2:-}" = submodule.recurse=false ] || exit 80
+	shift 2
+fi
+case ${1:-} in
+	clone)
+		shift
+		[ "${1:-}" = -- ] || exit 81
+		shift
+		repository=${1:-}
+		checkout=${2:-}
+		[ -n "$repository" ] && [ -n "$checkout" ] || exit 82
+		mkdir -p "$checkout/.git"
+		printf '%s\n' "$repository" > "$checkout/.git/config"
+		printf '%s\n' "$repository" > "$checkout/.source"
+		printf 'dotfiles source\n' > "$checkout/.bashrc"
+		printf 'restrictive mode test\n' > "$checkout/.private-settings"
+		chmod 600 "$checkout/.private-settings"
+		if [ "${REPO_INSTALLER:-yes}" = yes ]; then
+			printf '#!/bin/sh\nexit 0\n' > "$checkout/install.sh"
+			chmod 700 "$checkout/install.sh"
+		fi
+		if [ "${GIT_MODE:-success}" = clone-fail ]; then
+			printf 'simulated remote error for %s\n' "$repository" >&2
+			exit 83
+		fi
+		;;
+	-C)
+		checkout=${2:-}
+		operation=${3:-}
+		case $operation in
+			rev-parse)
+				if [ "${GIT_MODE:-success}" = ref-fail ]; then
+					printf 'simulated ref error for %s\n' "${DOTFILES_TEST_URL:-source}" >&2
+					exit 85
+				fi
+				printf 'fake-selected-commit\n'
+				;;
+			remote) printf 'origin\n' ;;
+			checkout)
+				ref=${5:-}
+				printf 'checked-out-ref=%s\n' "$ref" >> "$GIT_LOG"
+				printf 'selected ref: %s\n' "$ref" > "$checkout/selected-ref"
+				;;
+			*) exit 84 ;;
+		esac
+		;;
+	*) exit 86 ;;
+esac
+GIT
+chmod +x "$TMP_ROOT/git"
+
+make_fake_path() {
+	PATH="$FAKE_BIN:$TMP_ROOT:$ORIGINAL_PATH"
+	RUN_PATH=$PATH
+	export RUN_PATH
+}
+
+make_path_without_git() {
+	RESTRICTED_BIN="$CASE_DIR/no-git-bin"
+	mkdir -p "$RESTRICTED_BIN"
+	for utility in cat cp id mkdir mktemp rm; do
+		utility_path=$(command -v "$utility") || fail "missing utility: $utility"
+		ln -s "$utility_path" "$RESTRICTED_BIN/$utility"
+	done
+	cp "$TMP_ROOT/podman" "$RESTRICTED_BIN/podman"
+	chmod +x "$RESTRICTED_BIN/podman"
+	[ ! -e "$RESTRICTED_BIN/git" ] || fail "restricted PATH unexpectedly contains git"
+	RUN_PATH=$RESTRICTED_BIN
+	export RUN_PATH
+}
+
+# An empty/unset configuration must build without Git being available and
+# must not add dotfiles instructions to the existing Containerfile.
+prepare_case no-config
+make_path_without_git
+EXPECT_DOTFILES=no
+export EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "no-config image build failed: $output"
+assert_not_contains "$(cat "$CONTAINERFILE_CAPTURE")" 'dotfiles'
+[ ! -e "$GIT_LOG" ] || fail "no-config path invoked Git"
+
+# The legacy fixed context is retained for unconfigured builds, but any stale
+# checkout left by an interrupted earlier run is removed before the build.
+prepare_case stale-no-config
+mkdir -p "$CASE_CACHE/sd-vpnc/build/dotfiles/.git"
+printf 'stale checkout\n' > "$CASE_CACHE/sd-vpnc/build/dotfiles/.source"
+make_path_without_git
+EXPECT_DOTFILES=no
+export EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "no-config build with stale checkout failed: $output"
+[ ! -e "$CASE_CACHE/sd-vpnc/build/dotfiles" ] || fail "no-config build retained stale dotfiles checkout"
+[ -d "$CASE_CACHE/sd-vpnc/build" ] || fail "no-config build did not retain the legacy build context"
+
+prepare_case empty-values
+make_path_without_git
+SD_VPNC_DOTFILES=
+SD_VPNC_DOTFILES_REF=
+EXPECT_DOTFILES=no
+export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "empty-value image build failed: $output"
+[ ! -e "$GIT_LOG" ] || fail "empty-value path invoked Git"
+
+# A ref without a repository fails before Git is needed.
+prepare_case ref-without-url
+make_path_without_git
+SD_VPNC_DOTFILES=
+SD_VPNC_DOTFILES_REF=main
+export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF
+if output=$(run_sd 2>&1); then
+	fail "ref without repository unexpectedly succeeded"
+fi
+assert_contains "$output" 'SD_VPNC_DOTFILES_REF requires SD_VPNC_DOTFILES'
+[ ! -e "$GIT_LOG" ] || fail "ref-without-url path invoked Git"
+
+# Refs beginning with a dash are rejected before Git can parse them as options.
+prepare_case leading-dash-ref
+make_path_without_git
+SD_VPNC_DOTFILES=https://token@example.invalid/dotfiles.git
+SD_VPNC_DOTFILES_REF=--help
+export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF
+if output=$(run_sd 2>&1); then
+	fail "leading-dash ref unexpectedly succeeded"
+fi
+assert_contains "$output" "SD_VPNC_DOTFILES_REF must not start with '-'."
+assert_not_contains "$output" "$SD_VPNC_DOTFILES"
+[ ! -e "$GIT_LOG" ] || fail "leading-dash ref was passed to Git"
+
+# The host Git receives the URL/ref noninteractively, and the engine sees a
+# checkout without .git. The checkout is removed after the build completes.
+prepare_case configured
+make_fake_path
+SD_VPNC_DOTFILES=https://token@example.invalid/dotfiles.git
+SD_VPNC_DOTFILES_REF=release-tag
+DOTFILES_TEST_URL=$SD_VPNC_DOTFILES
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF DOTFILES_TEST_URL EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "configured image build failed: $output"
+assert_contains "$(cat "$GIT_LOG")" "[https://token@example.invalid/dotfiles.git]"
+assert_contains "$(cat "$GIT_LOG")" 'release-tag'
+assert_contains "$(cat "$GIT_LOG")" 'GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never GIT_SSH_COMMAND=ssh -o BatchMode=yes GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never stdin=closed'
+assert_not_contains "$(cat "$GIT_LOG")" '--recurse-submodules'
+[ -f "$CAPTURE_DIR/dotfiles/.bashrc" ] || fail "repository source was not available to the image build"
+[ ! -e "$CAPTURE_DIR/dotfiles/.git" ] || fail ".git metadata reached the image build"
+[ -x "$CAPTURE_DIR/dotfiles/install.sh" ] || fail "installer file mode was not preserved"
+[ "$(file_mode "$CAPTURE_DIR/dotfiles/.private-settings")" = 600 ] || fail "restrictive file mode was not preserved"
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY dotfiles /home/dev/.dotfiles'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /home/dev/.dotfiles'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /work'
+[ "$(grep -c '^FROM ' "$CONTAINERFILE_CAPTURE")" -eq 1 ] || fail "dotfiles setup unexpectedly uses a disposable image stage"
+DOTFILES_CONTAINERFILE=$(sed -n '/^COPY dotfiles /,$p' "$CONTAINERFILE_CAPTURE")
+assert_not_contains "$DOTFILES_CONTAINERFILE" 'chmod'
+assert_not_contains "$DOTFILES_CONTAINERFILE" 'chown'
+INSTALLER_RUN_LINE=$(sed -n 's/^RUN //p' "$CONTAINERFILE_CAPTURE" | grep -F 'bash ./install.sh' | tail -n 1)
+[ -n "$INSTALLER_RUN_LINE" ] || fail "could not locate generated installer command"
+INSTALLER_DIR="$CASE_DIR/installer-success"
+INSTALLER_RESULT="$CASE_DIR/installer-result"
+EXPECTED_CWD=$INSTALLER_DIR
+export INSTALLER_DIR INSTALLER_RESULT EXPECTED_CWD INSTALLER_RUN_LINE
+mkdir -p "$INSTALLER_DIR"
+cat >"$INSTALLER_DIR/install.sh" <<'INSTALLER'
+[ "$HOME" = /home/dev ] || exit 31
+[ "$PWD" = "$EXPECTED_CWD" ] || exit 32
+if read -r input; then exit 33; fi
+printf 'installer ran noninteractively\n' > "$INSTALLER_RESULT"
+INSTALLER
+(cd "$INSTALLER_DIR" && sh -c "$INSTALLER_RUN_LINE") || fail "successful installer command failed"
+[ -f "$INSTALLER_RESULT" ] || fail "installer did not receive expected HOME/cwd/closed stdin"
+INSTALLER_DIR="$CASE_DIR/installer-missing"
+export INSTALLER_DIR
+mkdir -p "$INSTALLER_DIR"
+(cd "$INSTALLER_DIR" && sh -c "$INSTALLER_RUN_LINE") || fail "missing installer was not skipped successfully"
+[ ! -e "$INSTALLER_DIR/.bashrc" ] || fail "missing installer unexpectedly created an automatic link"
+INSTALLER_DIR="$CASE_DIR/installer-failure"
+export INSTALLER_DIR
+mkdir -p "$INSTALLER_DIR"
+printf 'exit 17\n' > "$INSTALLER_DIR/install.sh"
+if (cd "$INSTALLER_DIR" && sh -c "$INSTALLER_RUN_LINE"); then
+	fail "nonzero installer result was not propagated"
+fi
+build_context=$(cat "$CONTAINER_LOG")
+case $build_context in
+	"$CASE_CACHE"/sd-vpnc/build.*) ;;
+	*) fail "configured build did not use a unique context beneath the cache root: $build_context" ;;
+esac
+assert_logged_context_removed
+assert_no_configured_contexts
+
+# Git's SSH command precedence is GIT_SSH_COMMAND, core.sshCommand, then GIT_SSH.
+prepare_case ssh-command-precedence
+make_fake_path
+SD_VPNC_DOTFILES=ssh-precedence-repo
+GIT_SSH_COMMAND='explicit ssh command'
+FAKE_CORE_SSH_COMMAND='configured ssh command'
+GIT_SSH='ignored ssh path'
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES GIT_SSH_COMMAND FAKE_CORE_SSH_COMMAND GIT_SSH EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "GIT_SSH_COMMAND precedence build failed: $output"
+assert_contains "$(cat "$GIT_LOG")" 'GIT_SSH_COMMAND=explicit ssh command -o BatchMode=yes'
+assert_logged_context_removed
+
+prepare_case core-ssh-command-precedence
+make_fake_path
+SD_VPNC_DOTFILES=core-ssh-precedence-repo
+FAKE_CORE_SSH_COMMAND='configured ssh command'
+FAKE_SYSTEM_SSH_COMMAND='lower-priority system ssh'
+GIT_SSH="$CASE_DIR/ignored ssh path"
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES GIT_SSH_COMMAND FAKE_CORE_SSH_COMMAND GIT_SSH EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "core.sshCommand precedence build failed: $output"
+assert_contains "$(cat "$GIT_LOG")" 'GIT_SSH_COMMAND=configured ssh command -o BatchMode=yes'
+assert_contains "$(cat "$GIT_LOG")" 'config-scope=global'
+assert_not_contains "$(cat "$GIT_LOG")" 'config-scope=local'
+assert_logged_context_removed
+
+prepare_case system-ssh-command
+make_fake_path
+SD_VPNC_DOTFILES=system-ssh-repo
+FAKE_SYSTEM_SSH_COMMAND='system ssh command'
+GIT_SSH='ignored-ssh-path'
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES FAKE_SYSTEM_SSH_COMMAND GIT_SSH EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "system core.sshCommand fallback build failed: $output"
+assert_contains "$(cat "$GIT_LOG")" 'GIT_SSH_COMMAND=system ssh command -o BatchMode=yes'
+assert_contains "$(cat "$GIT_LOG")" 'config-scope=system'
+assert_logged_context_removed
+
+# A caller project's local core.sshCommand must not override host global/system
+# SSH config because lookup is performed from the isolated build context.
+prepare_case caller-core-isolation
+make_fake_path
+CALLER_DIR="$CASE_DIR/caller-project"
+mkdir -p "$CALLER_DIR"
+if [ -n "$ORIGINAL_GIT" ]; then
+	"$ORIGINAL_GIT" -C "$CALLER_DIR" init -q
+	"$ORIGINAL_GIT" -C "$CALLER_DIR" config core.sshCommand 'real caller-local-ssh'
+fi
+SD_VPNC_DOTFILES=caller-core-isolation-repo
+FAKE_CORE_SSH_COMMAND='global-system-ssh'
+FAKE_CALLER_SSH_COMMAND='caller-project-ssh'
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES FAKE_CORE_SSH_COMMAND FAKE_CALLER_SSH_COMMAND EXPECT_DOTFILES
+output=$(cd "$CALLER_DIR" && run_sd 2>&1) || fail "caller core.sshCommand isolation build failed: $output"
+assert_contains "$(cat "$GIT_LOG")" 'GIT_SSH_COMMAND=global-system-ssh -o BatchMode=yes'
+assert_not_contains "$(cat "$GIT_LOG")" 'GIT_SSH_COMMAND=caller-project-ssh'
+assert_contains "$(cat "$GIT_LOG")" 'config-scope=global'
+assert_not_contains "$(cat "$GIT_LOG")" 'config-scope=local'
+assert_logged_context_removed
+
+# GIT_SSH is an executable path (not a command string); quote spaces before
+# appending the OpenSSH BatchMode option and verify the resulting shell command.
+prepare_case git-ssh-space-path
+make_fake_path
+GIT_SSH="$CASE_DIR/custom ssh"
+SSH_ARGS_LOG="$CASE_DIR/ssh-args.log"
+cat >"$GIT_SSH" <<'SSH'
+#!/bin/sh
+printf '%s\n' "$@" > "$SSH_ARGS_LOG"
+SSH
+chmod +x "$GIT_SSH"
+SD_VPNC_DOTFILES=git-ssh-space-repo
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES GIT_SSH_COMMAND FAKE_CORE_SSH_COMMAND GIT_SSH EXPECT_DOTFILES SSH_ARGS_LOG
+output=$(run_sd 2>&1) || fail "GIT_SSH path with spaces build failed: $output"
+ssh_command=$(sed -n 's/.*GIT_SSH_COMMAND=\(.*\) GIT_ASKPASS=.*/\1/p' "$GIT_LOG" | sed -n '1p')
+assert_contains "$ssh_command" "'$(printf '%s' "$GIT_SSH" | sed "s/'/'\\\\''/g")' -o BatchMode=yes"
+sh -c "$ssh_command \"\$@\"" git-host -p 22 example.invalid command
+assert_file_contains "$SSH_ARGS_LOG" 'BatchMode=yes'
+assert_file_contains "$SSH_ARGS_LOG" 'example.invalid'
+assert_logged_context_removed
+
+# Concurrent configured builds sharing one cache root must receive independent
+# contexts and cannot replace each other's checkout.
+prepare_case concurrent-builds
+make_fake_path
+(
+	PATH="$RUN_PATH" HOME="$CASE_HOME" XDG_CACHE_HOME="$CASE_CACHE" SD_VPNC_COLOR=never \
+	SD_VPNC_DOTFILES=concurrent-one SD_VPNC_DOTFILES_REF='' EXPECT_DOTFILES=yes EXPECT_SOURCE=concurrent-one \
+	CAPTURE_DIR="$CASE_DIR/one-capture" CONTAINERFILE_CAPTURE="$CASE_DIR/one.Containerfile" \
+	GIT_LOG="$CASE_DIR/one.git.log" CONTAINER_LOG="$CASE_DIR/one.container.log" CONTAINER_DELAY=1 \
+		"$REPO_ROOT/sd-vpnc" image --rebuild
+) >"$CASE_DIR/one.log" 2>&1 &
+first_pid=$!
+(
+	PATH="$RUN_PATH" HOME="$CASE_HOME" XDG_CACHE_HOME="$CASE_CACHE" SD_VPNC_COLOR=never \
+	SD_VPNC_DOTFILES=concurrent-two SD_VPNC_DOTFILES_REF='' EXPECT_DOTFILES=yes EXPECT_SOURCE=concurrent-two \
+	CAPTURE_DIR="$CASE_DIR/two-capture" CONTAINERFILE_CAPTURE="$CASE_DIR/two.Containerfile" \
+	GIT_LOG="$CASE_DIR/two.git.log" CONTAINER_LOG="$CASE_DIR/two.container.log" CONTAINER_DELAY=1 \
+		"$REPO_ROOT/sd-vpnc" image --rebuild
+) >"$CASE_DIR/two.log" 2>&1 &
+second_pid=$!
+if ! wait "$first_pid"; then
+	cat "$CASE_DIR/one.log" >&2
+	fail "first concurrent configured build failed"
+fi
+if ! wait "$second_pid"; then
+	cat "$CASE_DIR/two.log" >&2
+	fail "second concurrent configured build failed"
+fi
+[ "$(cat "$CASE_DIR/one-capture/dotfiles/.source")" = concurrent-one ] || fail "first configured build saw another checkout"
+[ "$(cat "$CASE_DIR/two-capture/dotfiles/.source")" = concurrent-two ] || fail "second configured build saw another checkout"
+first_context=$(cat "$CASE_DIR/one.container.log")
+second_context=$(cat "$CASE_DIR/two.container.log")
+[ "$first_context" != "$second_context" ] || fail "concurrent configured builds shared a context"
+case $first_context in "$CASE_CACHE"/sd-vpnc/build.*) ;; *) fail "first context was outside cache root" ;; esac
+case $second_context in "$CASE_CACHE"/sd-vpnc/build.*) ;; *) fail "second context was outside cache root" ;; esac
+[ ! -e "$first_context" ] && [ ! -e "$second_context" ] || fail "concurrent build contexts were not cleaned"
+assert_no_configured_contexts
+
+# A local relative path is passed unchanged while Git runs from the caller cwd.
+prepare_case relative-path
+make_fake_path
+CALLER_DIR="$CASE_DIR/caller"
+mkdir -p "$CALLER_DIR"
+SD_VPNC_DOTFILES=../local-dotfiles
+SD_VPNC_DOTFILES_REF=
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF EXPECT_DOTFILES
+output=$(cd "$CALLER_DIR" && run_sd 2>&1) || fail "relative-path build failed: $output"
+assert_contains "$(cat "$GIT_LOG")" 'cwd='
+assert_contains "$(cat "$GIT_LOG")" '[../local-dotfiles]'
+assert_contains "$(cat "$GIT_LOG")" "cwd=$CALLER_DIR"
+assert_logged_context_removed
+assert_no_configured_contexts
+
+# Host Git is required for a configured repository, but its absence is reported
+# generically and no container build is attempted.
+prepare_case git-unavailable
+make_path_without_git
+SD_VPNC_DOTFILES=https://token@example.invalid/private.git
+export SD_VPNC_DOTFILES
+if output=$(run_sd 2>&1); then
+	fail "configured build without Git unexpectedly succeeded"
+fi
+assert_contains "$output" 'Git is required to clone the configured dotfiles repository.'
+assert_not_contains "$output" "$SD_VPNC_DOTFILES"
+assert_no_configured_contexts
+[ ! -e "$CONTAINER_LOG" ] || fail "container build ran without host Git"
+
+# Clone failure after creating a partial checkout is generic in output and is
+# cleaned by the exit trap.
+prepare_case clone-failure
+make_fake_path
+SD_VPNC_DOTFILES=https://token@example.invalid/failing.git
+DOTFILES_TEST_URL=$SD_VPNC_DOTFILES
+GIT_MODE=clone-fail
+export SD_VPNC_DOTFILES DOTFILES_TEST_URL GIT_MODE
+if output=$(run_sd 2>&1); then
+	fail "clone failure unexpectedly succeeded"
+fi
+assert_contains "$output" 'Failed to clone the configured dotfiles repository.'
+assert_not_contains "$output" "$SD_VPNC_DOTFILES"
+assert_no_configured_contexts
+[ ! -e "$CONTAINER_LOG" ] || fail "container build ran after clone failure"
+
+# Ref-selection failure also cleans the checkout without exposing the URL.
+prepare_case ref-failure
+make_fake_path
+SD_VPNC_DOTFILES=https://token@example.invalid/ref-failing.git
+SD_VPNC_DOTFILES_REF=missing-ref
+DOTFILES_TEST_URL=$SD_VPNC_DOTFILES
+GIT_MODE=ref-fail
+export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF DOTFILES_TEST_URL GIT_MODE
+if output=$(run_sd 2>&1); then
+	fail "ref failure unexpectedly succeeded"
+fi
+assert_contains "$output" 'Failed to select the configured dotfiles ref.'
+assert_not_contains "$output" "$SD_VPNC_DOTFILES"
+assert_no_configured_contexts
+[ ! -e "$CONTAINER_LOG" ] || fail "container build ran after ref failure"
+
+# Container build errors (including installer errors reported by the engine)
+# propagate, redact the source URL, and still clean the checkout.
+prepare_case container-failure
+make_fake_path
+SD_VPNC_DOTFILES=https://token@example.invalid/build-failing.git
+DOTFILES_TEST_URL=$SD_VPNC_DOTFILES
+EXPECT_DOTFILES=yes
+CONTAINER_MODE=fail
+export SD_VPNC_DOTFILES DOTFILES_TEST_URL EXPECT_DOTFILES CONTAINER_MODE
+if output=$(run_sd 2>&1); then
+	fail "container build failure unexpectedly succeeded"
+fi
+assert_not_contains "$output" "$SD_VPNC_DOTFILES"
+assert_logged_context_removed
+assert_no_configured_contexts
+
+# Exercise real branch, tag, and commit selection against a temporary local
+# repository when host Git is available; this never accesses the network.
+if [ -n "$ORIGINAL_GIT" ]; then
+	prepare_case local-git-refs
+	LOCAL_REPO="$CASE_DIR/local repository"
+	mkdir -p "$LOCAL_REPO"
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" init -q
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" config user.name dotfiles-test
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" config user.email dotfiles-test@example.invalid
+	printf 'tag-ref\n' > "$LOCAL_REPO/.selection"
+	printf 'tag-ref\n' > "$LOCAL_REPO/.source"
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" add .selection .source
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" commit -qm tag-base
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" branch -M main
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" tag selected-tag
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" checkout -q -b feature
+	printf 'branch-ref\n' > "$LOCAL_REPO/.selection"
+	printf 'branch-ref\n' > "$LOCAL_REPO/.source"
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" commit -qam branch-tip
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" checkout -q main
+	printf 'commit-ref\n' > "$LOCAL_REPO/.selection"
+	printf 'commit-ref\n' > "$LOCAL_REPO/.source"
+	"$ORIGINAL_GIT" -C "$LOCAL_REPO" commit -qam commit-tip
+	LOCAL_COMMIT=$("$ORIGINAL_GIT" -C "$LOCAL_REPO" rev-parse HEAD)
+	cp "$TMP_ROOT/podman" "$FAKE_BIN/podman"
+	chmod +x "$FAKE_BIN/podman"
+	RUN_PATH="$FAKE_BIN:$ORIGINAL_PATH"
+	export RUN_PATH LOCAL_REPO
+	run_local_git_ref() {
+		ref_label=$1
+		ref_name=$2
+		expected_selection=$3
+		CASE_CACHE="$CASE_DIR/cache-$ref_label"
+		CASE_HOME="$CASE_DIR/home-$ref_label"
+		CAPTURE_DIR="$CASE_DIR/capture-$ref_label"
+		CONTAINERFILE_CAPTURE="$CASE_DIR/$ref_label.Containerfile"
+		GIT_LOG="$CASE_DIR/$ref_label.git.log"
+		CONTAINER_LOG="$CASE_DIR/$ref_label.container.log"
+		SD_VPNC_DOTFILES=$LOCAL_REPO
+		SD_VPNC_DOTFILES_REF=$ref_name
+		EXPECT_DOTFILES=yes
+		EXPECT_SOURCE=$expected_selection
+		mkdir -p "$CASE_HOME"
+		export CASE_CACHE CASE_HOME CAPTURE_DIR CONTAINERFILE_CAPTURE GIT_LOG CONTAINER_LOG
+		export SD_VPNC_DOTFILES SD_VPNC_DOTFILES_REF EXPECT_DOTFILES EXPECT_SOURCE
+		output=$(run_sd 2>&1) || fail "real local Git $ref_label build failed: $output"
+		[ "$(cat "$CAPTURE_DIR/dotfiles/.selection")" = "$expected_selection" ] || fail "real Git selected the wrong $ref_label state"
+		[ ! -e "$CAPTURE_DIR/dotfiles/.git" ] || fail "real Git metadata reached the build context"
+		assert_logged_context_removed
+		assert_no_configured_contexts
+	}
+	run_local_git_ref branch feature branch-ref
+	run_local_git_ref tag selected-tag tag-ref
+	run_local_git_ref commit "$LOCAL_COMMIT" commit-ref
+else
+	printf 'Skipping local Git ref test: host Git is unavailable.\n'
+fi
+
+# If no installer is present, the source is still copied and the Containerfile
+# conditionally skips the install command rather than auto-linking files.
+prepare_case missing-installer
+make_fake_path
+SD_VPNC_DOTFILES=https://example.invalid/no-installer.git
+REPO_INSTALLER=no
+EXPECT_DOTFILES=yes
+export SD_VPNC_DOTFILES REPO_INSTALLER EXPECT_DOTFILES
+output=$(run_sd 2>&1) || fail "missing-installer image build failed: $output"
+[ -f "$CAPTURE_DIR/dotfiles/.bashrc" ] || fail "source was not retained without install.sh"
+[ ! -e "$CAPTURE_DIR/dotfiles/install.sh" ] || fail "fake repository unexpectedly has install.sh"
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi'
+assert_not_contains "$(cat "$CONTAINERFILE_CAPTURE")" 'ln -s'
+assert_logged_context_removed
+assert_no_configured_contexts
+
+printf 'All dotfiles image-build tests passed.\n'

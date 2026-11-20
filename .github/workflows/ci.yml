@@ -22,9 +22,13 @@ jobs:
       - name: Validate shell syntax
         run: |
           sh -n sd-vpnc
+          sh -n tests/test-dotfiles-build.sh
 
       - name: Run ShellCheck
-        run: shellcheck sd-vpnc
+        run: shellcheck sd-vpnc tests/test-dotfiles-build.sh
+
+      - name: Test image build behavior
+        run: sh tests/test-dotfiles-build.sh
 
       - name: Smoke test command
         run: |
