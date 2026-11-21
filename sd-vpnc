@@ -582,6 +582,37 @@ home_tmpfs_args() {
 	esac
 }
 
+configure_runtime_mounts() {
+	podman_rootless=false
+	config_mount="$config_dir:/config:ro"
+	ssh_mount="$ssh_config:/home/dev/.ssh:ro"
+	work_mount="$workdir:/work"
+
+	[ "$container_command" = podman ] || return 0
+	if ! podman_rootless_status=$(podman info --format '{{.Host.Security.Rootless}}'); then
+		die "Failed to determine whether Podman is rootless."
+	fi
+	case $podman_rootless_status in
+		true)
+			podman_rootless=true
+			config_mount="$config_mount,z"
+			ssh_mount="$ssh_mount,z"
+			work_mount="$work_mount:z"
+			;;
+		false) ;;
+		*) die "Podman rootless detection returned an invalid result (expected true or false)." ;;
+	esac
+}
+
+run_container_engine() {
+	operation=$1
+	shift
+	if [ "$container_command" = podman ] && [ "$podman_rootless" = true ]; then
+		exec "$container_command" "$operation" --userns=keep-id "$@"
+	fi
+	exec "$container_command" "$operation" "$@"
+}
+
 status_item() {
 	state=$1
 	label=$2
@@ -722,7 +753,8 @@ run_container() {
 	uid=$(id -u)
 	gid=$(id -g)
 	home_tmpfs_args "$uid" "$gid"
-	exec "$container_command" run --rm -it \
+	configure_runtime_mounts
+	run_container_engine run --rm -it \
 		--name "$CONTAINER_NAME" \
 		--cap-add=NET_ADMIN \
 		--device /dev/net/tun \
@@ -730,9 +762,9 @@ run_container() {
 		"$home_tmpfs_flag" "$home_tmpfs_value" \
 		--workdir /home/dev \
 		-e HOME=/home/dev \
-		-v "$config_dir:/config:ro" \
-		-v "$ssh_config:/home/dev/.ssh:ro" \
-		-v "$workdir:/work" \
+		-v "$config_mount" \
+		-v "$ssh_mount" \
+		-v "$work_mount" \
 		"$IMAGE" "$mode" "$@"
 }
 
@@ -794,13 +826,14 @@ start_tun() {
 	uid=$(id -u)
 	gid=$(id -g)
 	home_tmpfs_args "$uid" "$gid"
+	configure_runtime_mounts
 	IFS=' '
 	set -f
 	# The accumulated tokens contain only fixed flags, validated ports and
 	# validated hostnames; quote the SSH destination separately.
 	# shellcheck disable=SC2086
 	set -- $publish_args "$IMAGE" tun "$host" $forward_args
-	container_id=$("$container_command" run --detach \
+	container_id=$(run_container_engine run --detach \
 		--name "$TUN_CONTAINER_NAME" \
 		--cap-add=NET_ADMIN \
 		--device /dev/net/tun \
@@ -808,9 +841,9 @@ start_tun() {
 		"$home_tmpfs_flag" "$home_tmpfs_value" \
 		--workdir /home/dev \
 		-e HOME=/home/dev \
-		-v "$config_dir:/config:ro" \
-		-v "$ssh_config:/home/dev/.ssh:ro" \
-		-v "$workdir:/work" \
+		-v "$config_mount" \
+		-v "$ssh_mount" \
+		-v "$work_mount" \
 		"$@") || die "Failed to start the tunnel container."
 	printf 'Starting tunnel container %s.\n' "$TUN_CONTAINER_NAME"
 	waited=0

@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-21
+goal: Resolve rootless Podman DAC and SELinux failures on /work, /config, and
+  read-only SSH mounts without changing Docker or rootful Podman behavior

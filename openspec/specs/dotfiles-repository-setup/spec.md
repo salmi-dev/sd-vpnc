@@ -136,7 +136,7 @@ During the image build, `sd-vpnc` SHALL run a repository-root `install.sh`, if p
 - **THEN** dotfiles are not fetched or installed again at container startup
 
 ### Requirement: Runtime ownership and mount limitations are documented
-The `README.md` SHALL state that the baked home remains root-owned while runtime `/home/dev` is private, writable, and session-only. It SHALL document template seeding and unreadable/disposable-root omission, XDG paths, Zsh/Bash history, Atuin's `ATUIN_HOME` data location, optional login Zsh with login Bash fallback, bare-SSH versus remote-SSH behavior, unchanged `/work` and read-only SSH mounts, and the lack of host UID build arguments or permission rewrites.
+The README SHALL describe baked root-owned home, private session-only runtime home, template seeding/omissions, XDG/shell/Atuin paths, mount paths, and no build-time UID arguments or permission rewrites. It SHALL distinguish home tmpfs ownership (no mapping change) from rootless Podman `--userns=keep-id` (retains `--user UID:GID` but changes mapping for the whole container). It SHALL document shared `:z` effects and recovery, unchanged rootful Podman/Docker, and unsupported rootless Docker.
 
 #### Scenario: User reads runtime ownership guidance
 - **WHEN** a user configures dotfiles setup and reviews runtime ownership guidance
@@ -144,11 +144,23 @@ The `README.md` SHALL state that the baked home remains root-owned while runtime
 
 #### Scenario: User reads runtime mount guidance
 - **WHEN** a user plans to use dotfiles configuration at runtime
-- **THEN** the README explains that the host SSH directory remains mounted read-only at `/home/dev/.ssh` and `/work` remains mounted from the host
+- **THEN** the README explains that the host SSH directory remains mounted read-only at `/home/dev/.ssh`, `/config` remains read-only, and `/work` remains writable at its existing host-mounted path
 
 #### Scenario: User reads interactive shell guidance
 - **WHEN** a user chooses an interactive shell path
 - **THEN** the README explains that `sd-vpnc shell` and bare `sd-vpnc ssh` use login Zsh when installed and interactive login Bash otherwise, Zsh is not installed by the base image, `sd-vpnc ssh HOST` still starts a remote SSH shell, and history is written under `/home/dev/.local/state`
+
+#### Scenario: User reads rootless Podman UID mapping guidance
+- **WHEN** a user reads the runtime ownership guidance for rootless Podman
+- **THEN** the README distinguishes home tmpfs ownership, which does not change UID mappings, from `--userns=keep-id`, which retains `--user UID:GID` but changes the mapping for the entire container
+
+#### Scenario: User reads rootless Podman mount security guidance
+- **WHEN** a user runs rootless Podman and reviews runtime mount guidance
+- **THEN** the README explains that shared `:z` persistently relabels all three host source trees, including SSH contents and VPN configuration and credentials, broadens SELinux access to `container_t` domains, and supports overlapping containers; it gives `restorecon -Rv` recovery guidance for the host config directory, SSH directory, and selected workdir, while stating config/SSH stay read-only and `/work` stays writable
+
+#### Scenario: User reads engine compatibility guidance
+- **WHEN** a user selects a container engine
+- **THEN** the README states that this rootless mount-access behavior applies only to rootless Podman, Docker and rootful Podman behavior is unchanged, and rootless Docker is unsupported and outside this change
 
 ### Requirement: User-facing security and authentication documentation
 The `README.md` SHALL explain that the installer executes arbitrary code as root during image build and that dotfiles startup code may execute at runtime with access to mounted SSH keys, VPN configuration and credentials, writable `/work`, and VPN connectivity. It SHALL tell users to trust the repository and ref and not store secrets in the repository, which remains in the final image. It SHALL explain that authentication uses host Git configuration, recommend a host credential helper or SSH agent, state that credentials are not forwarded and prompts are unsupported, and warn users not to embed tokens in URLs or expose repository URLs in errors. It SHALL not promise tools beyond the base image and may note available Fedora package tooling.
@@ -257,3 +269,22 @@ Local interactive shell entry points SHALL prefer login Zsh when available, with
 #### Scenario: Interactive history uses writable state
 - **WHEN** either interactive shell saves history
 - **THEN** Zsh/Bash history is placed under `/home/dev/.local/state` and Atuin uses `ATUIN_HOME=/home/dev/.atuin` with writable data under `/home/dev/.atuin/data` for the runtime UID:GID
+
+### Requirement: Rootless Podman can access the required host mounts
+Rootless Podman runtime containers SHALL map the configured numeric UID:GID to the invoking host identity and access the existing `/work`, `/config`, and SSH bind sources. Docker and rootful Podman SHALL retain their existing user-namespace and bind behavior.
+
+#### Scenario: Rootless Podman accesses private host directories
+- **WHEN** a rootless Podman container runs with host-owned mode-0700 bind sources and mode-0600 config and SSH files
+- **THEN** the configured container user can enter and write `/work`, read `/config/client.ovpn` and SSH configuration, and cannot write to the read-only `/config` or SSH mount
+
+#### Scenario: Rootless Podman runs with SELinux enforcing
+- **WHEN** a rootless Podman container accesses these host binds on an SELinux-enforcing host
+- **THEN** the container can use `/work`, `/config`, and SSH under normal SELinux confinement, with config and SSH still read-only
+
+#### Scenario: Two containers overlap under SELinux Enforcing
+- **WHEN** two rootless Podman containers overlap on an SELinux-Enforcing host while using the same temporary host config, SSH, and work sources
+- **THEN** both containers can read the VPN configuration and SSH configuration, cannot write to config or SSH, and can create distinct `/work` files owned by the host UID:GID without relabel conflict
+
+#### Scenario: Other engine modes remain unchanged
+- **WHEN** Docker or rootful Podman launches a runtime container
+- **THEN** it retains the existing `--user UID:GID`, bind paths, mount permissions, and user-namespace behavior without rootless-only relabeling
