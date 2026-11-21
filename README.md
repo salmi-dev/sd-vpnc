@@ -223,6 +223,14 @@ container is active, `shell` starts a VPN container and opens its interactive
 shell. The active container is shown in `sd-vpnc status`; it stops when the
 connection shell or SSH session exits.
 
+`sd-vpnc shell` and bare `sd-vpnc ssh` (without a destination or SSH arguments)
+start login Zsh when Zsh is available, and otherwise start interactive login
+Bash. Zsh is optional and is not installed by the base image; a dotfiles
+installer may add it. Shell history is written under
+`/home/dev/.local/state/sd-vpnc` for the lifetime of the container. By contrast,
+`sd-vpnc ssh HOST` invokes remote SSH and opens the remote default shell when no
+remote command is supplied; it does not select a local Zsh/Bash session.
+
 `--workdir`/`-C` mounts a host directory as `/work` inside the container. The
 option is the reliable way to choose a project directory; a container cannot
 change the current directory of its parent shell.
@@ -240,13 +248,40 @@ not built with a host-specific UID or GID. `/work` is mounted from the host;
 the host's SSH directory is mounted read-only at `/home/dev/.ssh`, masking any
 image content at that path.
 
-When dotfiles are configured, `/home/dev` and `/home/dev/.dotfiles` are baked
-into the image and root-owned, not host-persisted, and not generally writable
-by the runtime host UID. File modes are preserved: a restrictive root-owned
-file such as mode `0600` may be unreadable by the runtime UID. Installers should
-create runtime-readable, non-secret configuration and must not rely on the
-feature changing ownership or permissions. No host UID/GID build arguments or
-permission rewrites are applied.
+The baked `/home/dev` and `/home/dev/.dotfiles` remain root-owned in the image,
+and the image is not built with host-specific UID/GID arguments. At runtime, a
+private mode-0700 tmpfs overlays `/home/dev` and is owned by the invoking
+numeric UID:GID. Podman uses tmpfs `U=true,notmpcopyup` to set ownership without
+copying baked root-owned children into the tmpfs; this lets the runtime seed
+replace an image-owned `/home/dev/.config/atuin` directory with a runtime-owned
+one. Docker uses tmpfs `uid`, `gid`, and `mode` options. Neither approach
+changes the container's UID mapping, and no world-writable mode or image-home
+ownership/permission rewrite is used.
+
+After the root installer and temporary `.git` cleanup, a separate image template
+is made from the baked home without `.ssh`. At startup, readable ordinary files
+and symlinks are seeded into the tmpfs as the runtime user, preserving their
+modes but not root ownership. Unreadable root-owned entries are omitted without
+failing startup; they remain unavailable to the runtime user. The template's
+source modes and ownership are unchanged.
+
+Disposable state roots are not seeded. Fresh private runtime-owned directories
+are created for `/home/dev/.cache`, `/home/dev/.local/state`,
+`/home/dev/.local/share`, `/home/dev/.atuin`, and `/home/dev/.atuin/data`; fresh
+`.local` and `.local/share` parents prevent restrictive baked parent modes from
+blocking writes. Other readable `.local` children, such as tools under
+`.local/bin`, are seeded into the fresh parent. `XDG_CACHE_HOME`,
+`XDG_STATE_HOME`, and `XDG_DATA_HOME` point to the corresponding runtime paths.
+Zsh/Bash history goes under the state home; `ATUIN_HOME=/home/dev/.atuin`
+places Atuin data under `/home/dev/.atuin/data`. Both `.atuin` and legacy
+`.local/share/atuin` data are excluded from template seeding. The tmpfs, cache,
+history, and Atuin data are session-only and disappear when the container
+stops. Rebuild the image to refresh the baked home template; no `chown` or
+`chmod` is applied to image home content.
+
+The host's SSH directory is still mounted read-only at `/home/dev/.ssh`,
+masking any image content there, and the host work directory remains mounted
+writable at `/work`.
 
 ## Security
 
@@ -282,19 +317,37 @@ check the following before relying on the setup:
 - Build once with no root `install.sh`; confirm the repository remains in the
   image but no automatic links are created. Separately test a failing script
   and a system-level change to confirm failure propagation and persistence.
-- At runtime, confirm the host's read-only SSH mount masks image content under
-  `/home/dev/.ssh` and that `/work` remains the mounted writable host directory.
+- At runtime, verify with a non-image UID:GID that `/home/dev` and fresh
+  `.cache`, `.local/state`, `.local/share`, `.atuin`, and `.atuin/data` paths have
+  mode `0700` and accept writes. Use template `.cache`, `.local`, state/share,
+  and `.atuin` roots with mode `0555`; confirm readable sibling tools and
+  symlinks are seeded, disposable markers are excluded, and source template
+  modes remain unchanged. Confirm Zsh/Bash history and Atuin data point into the
+  writable session paths, while `.ssh` remains read-only and `/work` is
+  unchanged.
+- Check the generated Podman and Docker tmpfs arguments with fake engines. When
+  an accessible Docker daemon and local smoke-test image are available,
+  conditionally run a tmpfs ownership and write smoke test. Do not pull an image
+  as part of the test; skip with a clear message if either prerequisite is
+  missing.
+- When a local `localhost/sd-vpnc:$VERSION` image contains a root-owned
+  `/home/dev/.config/atuin`, conditionally verify the default Podman tmpfs
+  copy-up leaves it non-writable to the runtime UID, then verify
+  `U=true,notmpcopyup` followed by runtime seeding makes it writable. Skip if
+  the image or populated config path is unavailable; do not pull an image for
+  this check.
 
 ## Version and CI/CD
 
 `sd-vpnc` follows SemVer. The version is kept in the `VERSION` variable in the
 executable. CI validates shell syntax, runs ShellCheck, tests dotfiles image
-build behavior with fake Git/container commands and a local repository, and
-smoke-tests help, version, and agent guidance on pull requests and pushes to
-`main`. The behavior tests need no network access or Docker/Podman engine; they
-check the generated Containerfile and engine arguments (including the explicit
-`-f` Docker needs) against fake engines, so real-engine builds remain a manual
-check.
+build behavior with fake Git/container commands and a local repository, tests
+runtime home seeding and shell selection, and smoke-tests help, version, and
+agent guidance on pull requests and pushes to `main`. Fake-engine tests do not
+need Docker or Podman. Rootless Podman tmpfs behavior is smoke-tested where
+available; Docker's tmpfs flags have a conditional runtime smoke check when a
+daemon and local test image are available, otherwise only argument generation
+and documentation are verified without pulling images.
 
 After CI succeeds on a push to `main`, Auto Release creates a release commit
 that increments the patch version, pushes that commit, and creates a GitHub

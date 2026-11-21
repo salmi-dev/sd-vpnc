@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-20
+goal: Let the numeric runtime UID:GID write private home cache/state paths,
+  while preserving baked home content for readable runtime config and defining
+  login-shell fallback behavior.

@@ -67,7 +67,7 @@ ${BOLD}Commands${RESET}:
   init [--force]                     Create the configuration and work directories
   status                             Show configuration, runtime, and image status
   agent                              Print usage guidance for AI agents
-  ssh [ssh-arguments ...]            Connect the VPN, then forward arguments to ssh
+  ssh [ssh-arguments ...]            Connect the VPN; bare command opens local shell, otherwise forward to ssh
   ssh-tmux <ssh-host> [tmux-session] Connect SSH with an optional tmux session
   tun <ssh-host> <mapping...>        Start host-accessible local tunnels in background
   tun --stop                         Stop the background tunnel container
@@ -233,9 +233,15 @@ RUN dnf -y install \
 RUN mkdir -p /config /home/dev /work && chmod 0755 /home/dev
 
 COPY entrypoint.sh /usr/local/bin/sd-vpnc-entrypoint
-RUN chmod 0755 /usr/local/bin/sd-vpnc-entrypoint
+COPY home-init.sh /usr/local/lib/sd-vpnc-home-init.sh
+COPY sd-vpnc-shell /usr/local/bin/sd-vpnc-shell
+RUN chmod 0755 /usr/local/bin/sd-vpnc-entrypoint /usr/local/bin/sd-vpnc-shell
 
-ENV HOME=/home/dev
+ENV HOME=/home/dev \
+    XDG_CACHE_HOME=/home/dev/.cache \
+    XDG_STATE_HOME=/home/dev/.local/state \
+    XDG_DATA_HOME=/home/dev/.local/share \
+    ATUIN_HOME=/home/dev/.atuin
 WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/sd-vpnc-entrypoint"]
 CONTAINERFILE
@@ -243,6 +249,9 @@ CONTAINERFILE
 	cat >"$build_dir/entrypoint.sh" <<'ENTRYPOINT'
 #!/usr/bin/env bash
 set -euo pipefail
+
+. /usr/local/lib/sd-vpnc-home-init.sh
+sd_vpnc_seed_home /usr/share/sd-vpnc/home-template
 
 config=/config/client.ovpn
 credentials=/config/credentials
@@ -317,7 +326,7 @@ case "$mode" in
       ssh "${ssh_args[@]}" "$@"
     else
       echo "VPN is connected. OpenVPN log: $logfile"
-      /bin/bash -i
+      /usr/local/bin/sd-vpnc-shell
     fi
     ;;
   ssh-tmux)
@@ -414,6 +423,77 @@ case "$mode" in
 esac
 ENTRYPOINT
 
+	cat >"$build_dir/home-init.sh" <<'HOME_INIT'
+sd_vpnc_copy_entry() {
+	local source=$1 destination_dir=$2 destination mode
+	destination=$destination_dir/${source##*/}
+	if [[ -L "$source" ]]; then
+		cp -P -- "$source" "$destination"
+	elif [[ -d "$source" ]]; then
+		[[ -r "$source" && -x "$source" ]] || return 0
+		mkdir -p "$destination"
+		sd_vpnc_copy_contents "$source" "$destination"
+		mode=$(stat -c '%a' -- "$source")
+		chmod "$mode" -- "$destination"
+	elif [[ -f "$source" ]]; then
+		[[ -r "$source" ]] || return 0
+		if ! cp --preserve=mode -- "$source" "$destination"; then
+			[[ ! -r "$source" ]] && return 0
+			return 1
+		fi
+	fi
+}
+
+sd_vpnc_copy_contents() (
+	local source_dir=$1 destination_dir=$2 excluded=${3:-} item name
+	shopt -s dotglob nullglob
+	[[ ! -L "$source_dir" ]] || exit 0
+	[[ -d "$source_dir" && -r "$source_dir" && -x "$source_dir" ]] || exit 0
+	for item in "$source_dir"/*; do
+		name=${item##*/}
+		case " $excluded " in
+			*" $name "*) continue ;;
+		esac
+		sd_vpnc_copy_entry "$item" "$destination_dir" || exit $?
+	done
+)
+
+sd_vpnc_seed_home() {
+	local template=${1:-/usr/share/sd-vpnc/home-template} old_umask
+	[[ -d "$template" ]] || { printf 'Runtime home template is missing: %s\n' "$template" >&2; return 1; }
+	old_umask=$(umask)
+	umask 077
+	mkdir -p "$HOME/.cache" "$HOME/.local" "$HOME/.local/state" \
+		"$HOME/.local/share" "$HOME/.atuin" "$HOME/.atuin/data"
+	export XDG_CACHE_HOME="$HOME/.cache"
+	export XDG_STATE_HOME="$HOME/.local/state"
+	export XDG_DATA_HOME="$HOME/.local/share"
+	export ATUIN_HOME="$HOME/.atuin"
+	sd_vpnc_copy_contents "$template" "$HOME" '.ssh .cache .local .atuin'
+	sd_vpnc_copy_contents "$template/.local" "$HOME/.local" 'state share'
+	if [[ ! -L "$template/.local" ]]; then
+		sd_vpnc_copy_contents "$template/.local/share" "$HOME/.local/share" 'atuin'
+	fi
+	umask "$old_umask"
+}
+HOME_INIT
+
+	cat >"$build_dir/sd-vpnc-shell" <<'SHELL_SELECTOR'
+#!/usr/bin/env bash
+set -euo pipefail
+
+state_home=${XDG_STATE_HOME:-"${HOME:-/home/dev}/.local/state"}
+mkdir -p "$state_home/sd-vpnc"
+if command -v zsh >/dev/null 2>&1; then
+	export HISTFILE="$state_home/sd-vpnc/zsh_history"
+	export HISTSIZE=${HISTSIZE:-10000}
+	export SAVEHIST=${SAVEHIST:-10000}
+	exec zsh -l -i
+fi
+export HISTFILE="$state_home/sd-vpnc/bash_history"
+exec bash --login -i
+SHELL_SELECTOR
+
 	if [ -n "$dotfiles_repo" ]; then
 		# Podman needs the relabel option so SELinux hosts let the installer read
 		# the mounted metadata; BuildKit (Docker) rejects it.
@@ -429,6 +509,10 @@ ENTRYPOINT
 			printf '%s\n' 'WORKDIR /work'
 		} >>"$build_dir/Containerfile"
 	fi
+
+	{
+		printf '%s\n' 'RUN mkdir -p /usr/share/sd-vpnc/home-template && cp -a /home/dev/. /usr/share/sd-vpnc/home-template/ && rm -rf /usr/share/sd-vpnc/home-template/.ssh'
+	} >>"$build_dir/Containerfile"
 
 	printf '%s\n' "Building $IMAGE ..." >&2
 	"$container_command" build -f "$build_dir/Containerfile" -t "$IMAGE" "$build_dir"
@@ -482,6 +566,20 @@ detect_container() {
 	else
 		return 1
 	fi
+}
+
+home_tmpfs_args() {
+	case $container_command in
+		podman)
+			home_tmpfs_flag=--mount
+			home_tmpfs_value=type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup
+			;;
+		docker)
+			home_tmpfs_flag=--tmpfs
+			home_tmpfs_value="/home/dev:rw,uid=$1,gid=$2,mode=0700"
+			;;
+		*) die "Unsupported container engine: $container_command" ;;
+	esac
 }
 
 status_item() {
@@ -593,10 +691,10 @@ status_cmd() {
 shell_cmd() {
 	detect_container || die "Neither podman nor docker is installed."
 	if container_is_running_named "$TUN_CONTAINER_NAME"; then
-		exec "$container_command" exec -it "$TUN_CONTAINER_NAME" /bin/bash -i
+		exec "$container_command" exec -it "$TUN_CONTAINER_NAME" /usr/local/bin/sd-vpnc-shell
 	fi
 	container_is_running || die "No running VPN container. Start one with '$PROGRAM ssh', '$PROGRAM ssh <host>', or '$PROGRAM tun <host> <mapping>'."
-	exec "$container_command" exec -it "$CONTAINER_NAME" /bin/bash -i
+	exec "$container_command" exec -it "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-shell
 }
 
 run_container() {
@@ -623,11 +721,13 @@ run_container() {
 
 	uid=$(id -u)
 	gid=$(id -g)
+	home_tmpfs_args "$uid" "$gid"
 	exec "$container_command" run --rm -it \
 		--name "$CONTAINER_NAME" \
 		--cap-add=NET_ADMIN \
 		--device /dev/net/tun \
 		--user "$uid:$gid" \
+		"$home_tmpfs_flag" "$home_tmpfs_value" \
 		--workdir /home/dev \
 		-e HOME=/home/dev \
 		-v "$config_dir:/config:ro" \
@@ -693,6 +793,7 @@ start_tun() {
 
 	uid=$(id -u)
 	gid=$(id -g)
+	home_tmpfs_args "$uid" "$gid"
 	IFS=' '
 	set -f
 	# The accumulated tokens contain only fixed flags, validated ports and
@@ -704,6 +805,7 @@ start_tun() {
 		--cap-add=NET_ADMIN \
 		--device /dev/net/tun \
 		--user "$uid:$gid" \
+		"$home_tmpfs_flag" "$home_tmpfs_value" \
 		--workdir /home/dev \
 		-e HOME=/home/dev \
 		-v "$config_dir:/config:ro" \
@@ -786,7 +888,7 @@ Connection commands (these may establish a VPN connection):
   $PROGRAM cli                     Alias for shell.
 
 Use normal OpenSSH argument ordering: SSH options before the host, then an optional remote command.
-With no arguments, 'ssh' starts an interactive shell inside the VPN container.
+Bare 'ssh' (no destination or SSH arguments) starts a local interactive shell inside the VPN container. 'ssh HOST' invokes remote SSH and opens the remote default shell when no remote command is supplied.
 For host-accessible forwards, use 'tun' rather than 'ssh -L': tunnel ports are published
 on 127.0.0.1 of the host. Detached tunnels require SSH authentication without prompts.
 Use 'tun --stop' to close it. A regular SSH container is removed when its session exits.

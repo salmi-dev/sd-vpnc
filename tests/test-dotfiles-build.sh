@@ -9,7 +9,11 @@ GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/sd-vpnc-dotfiles.XXXXXX")
-trap 'rm -rf "$TMP_ROOT"' 0
+cleanup() {
+	chmod -R u+rwx "$TMP_ROOT" 2>/dev/null || true
+	rm -rf "$TMP_ROOT"
+}
+trap cleanup 0
 trap 'exit 1' HUP INT TERM
 
 fail() {
@@ -119,6 +123,13 @@ if [ -n "${SENTINEL:-}" ] && grep -rqF -- "$SENTINEL" "$build_context/dotfiles-g
 	exit 98
 fi
 cp "$build_context/Containerfile" "$CONTAINERFILE_CAPTURE"
+mkdir -p "$CAPTURE_DIR"
+cp "$build_context/home-init.sh" "$CAPTURE_DIR/home-init.sh"
+cp "$build_context/sd-vpnc-shell" "$CAPTURE_DIR/sd-vpnc-shell"
+cp "$build_context/entrypoint.sh" "$CAPTURE_DIR/entrypoint.sh"
+for generated_script in home-init.sh sd-vpnc-shell entrypoint.sh; do
+	/bin/bash -n "$CAPTURE_DIR/$generated_script" || exit 99
+done
 if [ "${EXPECT_DOTFILES:-no}" = yes ]; then
 	[ -d "$build_context/dotfiles" ] || exit 91
 	[ ! -e "$build_context/dotfiles/.git" ] || exit 92
@@ -350,7 +361,23 @@ assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY dotfiles /home/dev/.dotfiles
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /home/dev/.dotfiles'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN --mount=type=bind,source=dotfiles-git,target=/home/dev/.dotfiles/.git,z if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN rm -rf /home/dev/.dotfiles/.git'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN mkdir -p /usr/share/sd-vpnc/home-template && cp -a /home/dev/. /usr/share/sd-vpnc/home-template/ && rm -rf /usr/share/sd-vpnc/home-template/.ssh'
+cleanup_line=$(grep -nF 'RUN rm -rf /home/dev/.dotfiles/.git' "$CONTAINERFILE_CAPTURE" | cut -d: -f1)
+template_line=$(grep -nF 'RUN mkdir -p /usr/share/sd-vpnc/home-template' "$CONTAINERFILE_CAPTURE" | cut -d: -f1)
+[ "$template_line" -gt "$cleanup_line" ] || fail "runtime home template was copied before Git metadata cleanup"
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY home-init.sh /usr/local/lib/sd-vpnc-home-init.sh'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY sd-vpnc-shell /usr/local/bin/sd-vpnc-shell'
+BASE_PACKAGES=$(sed -n '/^RUN dnf -y install/,/dnf clean all/p' "$CONTAINERFILE_CAPTURE")
+assert_not_contains "$BASE_PACKAGES" 'zsh'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'XDG_STATE_HOME=/home/dev/.local/state'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'ATUIN_HOME=/home/dev/.atuin'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /work'
+assert_file_contains "$CAPTURE_DIR/entrypoint.sh" 'sd_vpnc_seed_home /usr/share/sd-vpnc/home-template'
+assert_file_contains "$CAPTURE_DIR/entrypoint.sh" '/usr/local/bin/sd-vpnc-shell'
+assert_file_contains "$CAPTURE_DIR/entrypoint.sh" "ssh \"\${ssh_args[@]}\" \"\$@\""
+ssh_forward_line=$(grep -nF "ssh \"\${ssh_args[@]}\" \"\$@\"" "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
+local_shell_line=$(grep -nF '/usr/local/bin/sd-vpnc-shell' "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
+[ "$ssh_forward_line" -lt "$local_shell_line" ] || fail "remote SSH forwarding was replaced by the local shell selector"
 # The metadata is only ever bind-mounted; no instruction may copy it into a layer.
 assert_not_contains "$(grep -E '^(COPY|ADD) ' "$CONTAINERFILE_CAPTURE")" 'dotfiles-git'
 assert_not_contains "$(grep -E '^(COPY|ADD) ' "$CONTAINERFILE_CAPTURE")" '.git'
@@ -778,8 +805,350 @@ output=$(run_sd 2>&1) || fail "missing-installer image build failed: $output"
 [ -f "$CAPTURE_DIR/dotfiles/.bashrc" ] || fail "source was not retained without install.sh"
 [ ! -e "$CAPTURE_DIR/dotfiles/install.sh" ] || fail "fake repository unexpectedly has install.sh"
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'if [ -f ./install.sh ]; then HOME=/home/dev bash ./install.sh </dev/null; fi'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'RUN mkdir -p /usr/share/sd-vpnc/home-template && cp -a /home/dev/. /usr/share/sd-vpnc/home-template/ && rm -rf /usr/share/sd-vpnc/home-template/.ssh'
 assert_not_contains "$(cat "$CONTAINERFILE_CAPTURE")" 'ln -s'
 assert_logged_context_removed
 assert_no_configured_contexts
 
-printf 'All dotfiles image-build tests passed.\n'
+# Runtime home seeding uses fresh private XDG roots, preserves readable sibling
+# content and symlinks, and leaves the image template untouched.
+HOME_INIT_FILE=$CAPTURE_DIR/home-init.sh
+SHELL_SELECTOR_FILE=$CAPTURE_DIR/sd-vpnc-shell
+HOME_TEMPLATE="$CASE_DIR/runtime-home-template"
+RUNTIME_HOME="$CASE_DIR/runtime-home"
+mkdir -p "$HOME_TEMPLATE/.dotfiles" "$HOME_TEMPLATE/.cache" \
+	"$HOME_TEMPLATE/.local/state" "$HOME_TEMPLATE/.local/share/atuin" \
+	"$HOME_TEMPLATE/.local/share/tool-data" "$HOME_TEMPLATE/.local/bin" \
+	"$HOME_TEMPLATE/.atuin/data" "$HOME_TEMPLATE/.ssh"
+printf 'readable config\n' > "$HOME_TEMPLATE/.zshrc"
+printf 'dotfiles config\n' > "$HOME_TEMPLATE/.dotfiles/config"
+printf 'stale cache\n' > "$HOME_TEMPLATE/.cache/marker"
+printf 'stale history\n' > "$HOME_TEMPLATE/.local/state/marker"
+printf 'stale legacy Atuin database\n' > "$HOME_TEMPLATE/.local/share/atuin/history.db"
+printf 'stale Atuin database\n' > "$HOME_TEMPLATE/.atuin/data/history.db"
+printf 'tool\n' > "$HOME_TEMPLATE/.local/bin/tool"
+printf 'tool data\n' > "$HOME_TEMPLATE/.local/share/tool-data/config"
+printf 'ssh config\n' > "$HOME_TEMPLATE/.ssh/config"
+printf 'unreadable\n' > "$HOME_TEMPLATE/.private"
+printf 'relative target\n' > "$HOME_TEMPLATE/.dotfiles/target"
+chmod 755 "$HOME_TEMPLATE/.dotfiles" "$HOME_TEMPLATE/.local/bin" "$HOME_TEMPLATE/.local/share/tool-data"
+chmod 644 "$HOME_TEMPLATE/.zshrc" "$HOME_TEMPLATE/.dotfiles/config" \
+	"$HOME_TEMPLATE/.local/share/tool-data/config" "$HOME_TEMPLATE/.ssh/config"
+chmod 755 "$HOME_TEMPLATE/.local/bin/tool"
+chmod 000 "$HOME_TEMPLATE/.private"
+ln -s .dotfiles/target "$HOME_TEMPLATE/.zshrc-link"
+chmod 0555 "$HOME_TEMPLATE/.cache" "$HOME_TEMPLATE/.local" \
+	"$HOME_TEMPLATE/.local/state" "$HOME_TEMPLATE/.local/share" \
+	"$HOME_TEMPLATE/.local/share/atuin" "$HOME_TEMPLATE/.atuin" \
+	"$HOME_TEMPLATE/.atuin/data"
+mkdir -m 0700 "$RUNTIME_HOME"
+HOME_INIT_FILE="$HOME_INIT_FILE" HOME_TEMPLATE="$HOME_TEMPLATE" HOME="$RUNTIME_HOME" \
+	/bin/bash -c '
+set -euo pipefail
+. "$HOME_INIT_FILE"
+before_umask=$(umask)
+sd_vpnc_seed_home "$HOME_TEMPLATE"
+[ "$(umask)" = "$before_umask" ] || { echo "runtime home setup changed umask" >&2; exit 1; }
+uid=$(id -u)
+gid=$(id -g)
+for path in "$HOME/.cache" "$HOME/.local" "$HOME/.local/state" "$HOME/.local/share" "$HOME/.atuin" "$HOME/.atuin/data"; do
+	[ "$(stat -c %a "$path")" = 700 ] || { echo "unexpected mode on $path" >&2; exit 1; }
+	[ "$(stat -c %u:%g "$path")" = "$uid:$gid" ] || { echo "unexpected owner on $path" >&2; exit 1; }
+done
+[ "$XDG_CACHE_HOME" = "$HOME/.cache" ]
+[ "$XDG_STATE_HOME" = "$HOME/.local/state" ]
+[ "$XDG_DATA_HOME" = "$HOME/.local/share" ]
+[ "$ATUIN_HOME" = "$HOME/.atuin" ]
+[ -f "$HOME/.zshrc" ] && [ -f "$HOME/.dotfiles/config" ]
+[ -L "$HOME/.zshrc-link" ] && [ "$(cat "$HOME/.zshrc-link")" = "relative target" ]
+[ -f "$HOME/.local/bin/tool" ] && [ "$(stat -c %a "$HOME/.local/bin/tool")" = 755 ]
+[ -f "$HOME/.local/share/tool-data/config" ]
+[ ! -e "$HOME/.cache/marker" ] && [ ! -e "$HOME/.local/state/marker" ]
+[ ! -e "$HOME/.local/share/atuin/history.db" ] && [ ! -e "$HOME/.atuin/data/history.db" ]
+[ ! -e "$HOME/.ssh/config" ] && [ ! -e "$HOME/.private" ]
+touch "$HOME/.cache/new" "$HOME/.local/state/history" "$HOME/.atuin/data/new-db"
+' || fail "runtime home seeding failed"
+[ "$(file_mode "$HOME_TEMPLATE/.cache")" = 555 ] || fail "template cache mode changed"
+[ "$(file_mode "$HOME_TEMPLATE/.local")" = 555 ] || fail "template .local mode changed"
+[ "$(file_mode "$HOME_TEMPLATE/.local/state")" = 555 ] || fail "template state mode changed"
+[ "$(file_mode "$HOME_TEMPLATE/.local/share")" = 555 ] || fail "template share mode changed"
+[ "$(file_mode "$HOME_TEMPLATE/.local/share/atuin")" = 555 ] || fail "legacy template Atuin mode changed"
+[ "$(file_mode "$HOME_TEMPLATE/.atuin")" = 555 ] || fail "template .atuin mode changed"
+[ "$(file_mode "$HOME_TEMPLATE/.atuin/data")" = 555 ] || fail "template Atuin data mode changed"
+[ "$(file_mode "$HOME_TEMPLATE/.private")" = 0 ] || fail "unreadable template file mode changed"
+
+# Symlink source roots are not traversed, while ordinary template symlinks are
+# still preserved by the runtime copy helper.
+EXTERNAL_SENTINEL="$CASE_DIR/external-local"
+mkdir -p "$EXTERNAL_SENTINEL/share" "$EXTERNAL_SENTINEL/bin"
+printf 'outside local child\n' > "$EXTERNAL_SENTINEL/bin/sentinel"
+printf 'outside share child\n' > "$EXTERNAL_SENTINEL/share/sentinel"
+SYMLINK_LOCAL_TEMPLATE="$CASE_DIR/symlink-local-template"
+SYMLINK_LOCAL_HOME="$CASE_DIR/symlink-local-home"
+mkdir -p "$SYMLINK_LOCAL_TEMPLATE"
+ln -s "$EXTERNAL_SENTINEL" "$SYMLINK_LOCAL_TEMPLATE/.local"
+mkdir -m 0700 "$SYMLINK_LOCAL_HOME"
+HOME_INIT_FILE="$HOME_INIT_FILE" HOME_TEMPLATE="$SYMLINK_LOCAL_TEMPLATE" HOME="$SYMLINK_LOCAL_HOME" \
+	/bin/bash -c '. "$HOME_INIT_FILE"; sd_vpnc_seed_home "$HOME_TEMPLATE"' || fail "symlink .local seed failed"
+[ ! -e "$SYMLINK_LOCAL_HOME/.local/bin/sentinel" ] || fail "symlinked .local source was traversed"
+SYMLINK_SHARE_TEMPLATE="$CASE_DIR/symlink-share-template"
+SYMLINK_SHARE_HOME="$CASE_DIR/symlink-share-home"
+mkdir -p "$SYMLINK_SHARE_TEMPLATE/.local"
+ln -s "$EXTERNAL_SENTINEL/share" "$SYMLINK_SHARE_TEMPLATE/.local/share"
+mkdir -m 0700 "$SYMLINK_SHARE_HOME"
+HOME_INIT_FILE="$HOME_INIT_FILE" HOME_TEMPLATE="$SYMLINK_SHARE_TEMPLATE" HOME="$SYMLINK_SHARE_HOME" \
+	/bin/bash -c '. "$HOME_INIT_FILE"; sd_vpnc_seed_home "$HOME_TEMPLATE"' || fail "symlink .local/share seed failed"
+[ ! -e "$SYMLINK_SHARE_HOME/.local/share/sentinel" ] || fail "symlinked .local/share source was traversed"
+[ -f "$EXTERNAL_SENTINEL/bin/sentinel" ] && [ -f "$EXTERNAL_SENTINEL/share/sentinel" ] || fail "symlink source sentinel was changed"
+
+# The shared shell selector starts login Zsh when present and chooses the
+# explicit interactive login Bash fallback otherwise, with history under state.
+mkdir -p "$CASE_DIR/fake-zsh-bin" "$CASE_DIR/fake-bash-bin"
+for bin_dir in "$CASE_DIR/fake-zsh-bin" "$CASE_DIR/fake-bash-bin"; do
+	ln -s "$(command -v mkdir)" "$bin_dir/mkdir"
+done
+cat > "$CASE_DIR/fake-zsh-bin/zsh" <<'ZSH'
+#!/bin/sh
+printf '%s\n' "$@" > "$SHELL_ARGS_LOG"
+printf '%s\n' "$HISTFILE" > "$SHELL_HIST_LOG"
+printf '%s\n' "$XDG_DATA_HOME" > "$SHELL_DATA_LOG"
+ZSH
+cat > "$CASE_DIR/fake-bash-bin/bash" <<'BASH'
+#!/bin/sh
+printf '%s\n' "$@" > "$SHELL_ARGS_LOG"
+printf '%s\n' "$HISTFILE" > "$SHELL_HIST_LOG"
+BASH
+chmod +x "$CASE_DIR/fake-zsh-bin/zsh" "$CASE_DIR/fake-bash-bin/bash"
+SHELL_ARGS_LOG="$CASE_DIR/zsh-args" SHELL_HIST_LOG="$CASE_DIR/zsh-hist" \
+	SHELL_DATA_LOG="$CASE_DIR/zsh-data" HOME="$RUNTIME_HOME" \
+	XDG_STATE_HOME="$RUNTIME_HOME/.local/state" XDG_DATA_HOME="$RUNTIME_HOME/.local/share" \
+	PATH="$CASE_DIR/fake-zsh-bin" /bin/bash "$SHELL_SELECTOR_FILE" || fail "Zsh selector failed"
+assert_contains "$(cat "$CASE_DIR/zsh-args")" '-l'
+assert_contains "$(cat "$CASE_DIR/zsh-args")" '-i'
+assert_contains "$(cat "$CASE_DIR/zsh-hist")" '/.local/state/sd-vpnc/zsh_history'
+assert_contains "$(cat "$CASE_DIR/zsh-data")" '/.local/share'
+SHELL_ARGS_LOG="$CASE_DIR/bash-args" SHELL_HIST_LOG="$CASE_DIR/bash-hist" \
+	HOME="$RUNTIME_HOME" XDG_STATE_HOME="$RUNTIME_HOME/.local/state" \
+	XDG_DATA_HOME="$RUNTIME_HOME/.local/share" PATH="$CASE_DIR/fake-bash-bin" \
+	/bin/bash "$SHELL_SELECTOR_FILE" || fail "Bash fallback selector failed"
+assert_contains "$(cat "$CASE_DIR/bash-args")" '--login'
+assert_contains "$(cat "$CASE_DIR/bash-args")" '-i'
+assert_contains "$(cat "$CASE_DIR/bash-hist")" '/.local/state/sd-vpnc/bash_history'
+
+# Fake runtime engines record both launch modes without changing /work or SSH.
+RUNTIME_ENGINE_SCRIPT="$TMP_ROOT/runtime-engine"
+cat > "$RUNTIME_ENGINE_SCRIPT" <<'ENGINE'
+#!/bin/sh
+set -eu
+printf '%s' "${0##*/}" >> "$RUNTIME_LOG"
+for argument do printf '[%s]' "$argument" >> "$RUNTIME_LOG"; done
+printf '\n' >> "$RUNTIME_LOG"
+case ${1:-} in
+	container)
+		case ${2:-} in
+			inspect)
+				if [ -f "$RUNTIME_STATE" ]; then
+					[ "${3:-}" != --format ] || printf 'true\n'
+					exit 0
+				fi
+				if [ "${3:-}" = --format ]; then printf 'false\n'; exit 0; fi
+				exit 1
+				;;
+			rm) rm -f "$RUNTIME_STATE"; exit 0 ;;
+		esac
+		;;
+	image) exit 0 ;;
+	run)
+		case " $* " in *' --detach '*) : > "$RUNTIME_STATE"; printf 'fake-container-id\n' ;; esac
+		exit 0
+		;;
+	exec|logs) exit 0 ;;
+esac
+exit 90
+ENGINE
+chmod +x "$RUNTIME_ENGINE_SCRIPT"
+prepare_runtime_cli_case() {
+	prepare_case "$1"
+	mkdir -p "$CASE_HOME/.config/sd-vpnc" "$CASE_HOME/.ssh" "$CASE_HOME/.local/share/sd-vpnc"
+	: > "$CASE_HOME/.config/sd-vpnc/client.ovpn"
+	RUNTIME_LOG="$CASE_DIR/runtime.log"
+	RUNTIME_STATE="$CASE_DIR/container-state"
+	export RUNTIME_LOG RUNTIME_STATE
+}
+make_runtime_podman_path() {
+	RUNTIME_BIN="$CASE_DIR/runtime-podman-bin"
+	mkdir -p "$RUNTIME_BIN"
+	cp "$RUNTIME_ENGINE_SCRIPT" "$RUNTIME_BIN/podman"
+	chmod +x "$RUNTIME_BIN/podman"
+	RUN_PATH="$RUNTIME_BIN:$ORIGINAL_PATH"
+	export RUN_PATH
+}
+make_runtime_docker_path() {
+	DOCKER_RUNTIME_BIN="$CASE_DIR/runtime-docker-bin"
+	mkdir -p "$DOCKER_RUNTIME_BIN"
+	for utility in awk grep id mkdir rm sed sleep; do
+		utility_path=$(command -v "$utility") || fail "missing runtime utility: $utility"
+		ln -s "$utility_path" "$DOCKER_RUNTIME_BIN/$utility"
+	done
+	cp "$RUNTIME_ENGINE_SCRIPT" "$DOCKER_RUNTIME_BIN/docker"
+	chmod +x "$DOCKER_RUNTIME_BIN/docker"
+	RUN_PATH=$DOCKER_RUNTIME_BIN
+	export RUN_PATH
+}
+run_runtime_cli() {
+	PATH="$RUN_PATH" HOME="$CASE_HOME" XDG_CONFIG_HOME="$CASE_HOME/.config" \
+		XDG_DATA_HOME="$CASE_HOME/.local/share" SD_VPNC_COLOR=never \
+		"$REPO_ROOT/sd-vpnc" "$@"
+}
+uid=$(id -u)
+gid=$(id -g)
+prepare_runtime_cli_case runtime-podman-regular
+make_runtime_podman_path
+output=$(run_runtime_cli ssh 2>&1) || fail "Podman regular runtime argument test failed: $output"
+runtime_args=$(cat "$RUNTIME_LOG")
+assert_contains "$runtime_args" "[--user][$uid:$gid]"
+assert_contains "$runtime_args" '[--mount][type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup]'
+assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
+assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+assert_not_contains "$runtime_args" '--userns=keep-id'
+
+prepare_runtime_cli_case runtime-podman-host-shell
+make_runtime_podman_path
+output=$(run_runtime_cli ssh remote-host 2>&1) || fail "remote SSH host argument test failed: $output"
+assert_contains "$(cat "$RUNTIME_LOG")" '[ssh][remote-host]'
+
+prepare_runtime_cli_case runtime-podman-detached
+make_runtime_podman_path
+output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "Podman detached runtime argument test failed: $output"
+runtime_args=$(cat "$RUNTIME_LOG")
+assert_contains "$runtime_args" '[--detach]'
+assert_contains "$runtime_args" '[--mount][type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup]'
+assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
+assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+
+prepare_runtime_cli_case runtime-docker-regular
+make_runtime_docker_path
+output=$(run_runtime_cli ssh 2>&1) || fail "Docker regular runtime argument test failed: $output"
+runtime_args=$(cat "$RUNTIME_LOG")
+assert_contains "$runtime_args" "[--user][$uid:$gid]"
+assert_contains "$runtime_args" "[--tmpfs][/home/dev:rw,uid=$uid,gid=$gid,mode=0700]"
+assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
+assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+
+prepare_runtime_cli_case runtime-docker-detached
+make_runtime_docker_path
+output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "Docker detached runtime argument test failed: $output"
+runtime_args=$(cat "$RUNTIME_LOG")
+assert_contains "$runtime_args" '[--detach]'
+assert_contains "$runtime_args" "[--tmpfs][/home/dev:rw,uid=$uid,gid=$gid,mode=0700]"
+assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
+assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+
+# Existing-container `shell` execs the same selector used by the entrypoint.
+prepare_runtime_cli_case runtime-shell-exec
+make_runtime_podman_path
+: > "$RUNTIME_STATE"
+output=$(run_runtime_cli shell 2>&1) || fail "existing-container shell selector invocation failed: $output"
+assert_contains "$(cat "$RUNTIME_LOG")" '[/usr/local/bin/sd-vpnc-shell]'
+
+# Use the host engines, not fake commands left at the front of PATH by the
+# command-argument tests. Engine smoke checks are conditional and report skips.
+PATH=$ORIGINAL_PATH
+export PATH
+if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+	PODMAN_SMOKE_IMAGE=registry.fedoraproject.org/fedora:42
+	if podman image inspect "$PODMAN_SMOKE_IMAGE" >/dev/null 2>&1; then
+		HOST_SSH="$CASE_DIR/podman-ssh"
+		mkdir -m 0755 "$HOST_SSH"
+		printf 'host ssh config\n' > "$HOST_SSH/config"
+		chmod 0644 "$HOST_SSH/config"
+		podman run --rm --user 12345:6789 \
+			--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
+			-v "$HOME_INIT_FILE:/tmp/home-init.sh:ro,Z" \
+			-v "$HOME_TEMPLATE:/tmp/home-template:ro,Z" \
+			-v "$HOST_SSH:/home/dev/.ssh:ro,Z" \
+			-e HOME=/home/dev --entrypoint /bin/bash "$PODMAN_SMOKE_IMAGE" -c '
+				set -euo pipefail
+				. /tmp/home-init.sh
+				sd_vpnc_seed_home /tmp/home-template
+				[ "$(stat -c %u:%g /home/dev)" = 12345:6789 ]
+				[ "$(stat -c %a /home/dev)" = 700 ]
+				[ "$(stat -c %u:%g /home/dev/.cache)" = 12345:6789 ]
+				[ "$(stat -c %a /home/dev/.cache)" = 700 ]
+				[ -f /home/dev/.local/bin/tool ]
+				[ "${ATUIN_HOME}" = /home/dev/.atuin ]
+				[ ! -e /home/dev/.atuin/data/history.db ]
+				[ ! -e /home/dev/.local/share/atuin/history.db ]
+				[ "$(cat /home/dev/.ssh/config)" = "host ssh config" ]
+				if touch /home/dev/.ssh/write-probe 2>/dev/null; then exit 1; fi
+				touch /home/dev/.cache/new
+				touch /home/dev/.local/state/history /home/dev/.atuin/data/db
+			' || fail "rootless Podman home seeding and UID:GID smoke test failed"
+		podman run --rm --user 12345:6789 \
+			--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
+			-e HOME=/home/dev --entrypoint /bin/sh "$PODMAN_SMOKE_IMAGE" -c '
+				[ ! -e /home/dev/.local/state/history ]
+				[ ! -e /home/dev/.atuin/data/db ]
+			' || fail "runtime Atuin/state unexpectedly persisted between containers"
+		[ "$(file_mode "$HOME_TEMPLATE/.cache")" = 555 ] || fail "Podman smoke changed source cache mode"
+		[ "$(file_mode "$HOME_TEMPLATE/.local")" = 555 ] || fail "Podman smoke changed source .local mode"
+		[ "$(file_mode "$HOME_TEMPLATE/.local/state")" = 555 ] || fail "Podman smoke changed source state mode"
+		[ "$(file_mode "$HOME_TEMPLATE/.local/share")" = 555 ] || fail "Podman smoke changed source share mode"
+		APP_VERSION=$(sed -n 's/^VERSION=//p' "$REPO_ROOT/sd-vpnc" | head -n 1)
+		APP_IMAGE="localhost/sd-vpnc:$APP_VERSION"
+		if podman image inspect "$APP_IMAGE" >/dev/null 2>&1; then
+			if podman run --rm --user 12345:6789 \
+				--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true \
+				--entrypoint /bin/sh "$APP_IMAGE" -c '
+				set -e
+				[ -d /home/dev/.config/atuin ]
+				[ "$(stat -c %u:%g /home/dev/.config/atuin)" = 0:0 ]
+				[ -r /home/dev/.config/atuin ] && [ -x /home/dev/.config/atuin ]
+				[ -r /usr/local/lib/sd-vpnc-home-init.sh ]
+				[ -d /usr/share/sd-vpnc/home-template/.config/atuin ]
+				if touch /home/dev/.config/atuin/.tmpfs-copyup-probe 2>/dev/null; then
+					rm -f /home/dev/.config/atuin/.tmpfs-copyup-probe
+					exit 1
+				fi
+			'; then
+				podman run --rm --user 12345:6789 \
+					--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
+					-e HOME=/home/dev --entrypoint /bin/bash "$APP_IMAGE" -c '
+						set -euo pipefail
+						. /usr/local/lib/sd-vpnc-home-init.sh
+						sd_vpnc_seed_home /usr/share/sd-vpnc/home-template
+						[ "$(stat -c %u:%g /home/dev/.config/atuin)" = 12345:6789 ]
+						touch /home/dev/.config/atuin/config.toml
+					' || fail "no-copy-up smoke failed to seed writable .config/atuin"
+			else
+				printf 'Skipping copy-up regression smoke: local app image lacks an unreadable root-owned /home/dev/.config/atuin.\n'
+			fi
+		else
+			printf 'Skipping copy-up regression smoke: local app image %s is unavailable (no pull attempted).\n' "$APP_IMAGE"
+		fi
+	else
+		printf 'Skipping Podman home smoke: Fedora 42 image is not locally available.\n'
+	fi
+else
+	printf 'Skipping Podman home smoke: no accessible Podman engine.\n'
+fi
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+	DOCKER_SMOKE_IMAGE=${SD_VPNC_DOCKER_SMOKE_IMAGE:-busybox:latest}
+	if docker image inspect "$DOCKER_SMOKE_IMAGE" >/dev/null 2>&1; then
+		docker run --rm --user 12345:6789 \
+			--tmpfs /home/dev:rw,uid=12345,gid=6789,mode=0700 \
+			--entrypoint sh "$DOCKER_SMOKE_IMAGE" -c '
+				[ "$(stat -c %u:%g /home/dev)" = 12345:6789 ]
+				[ "$(stat -c %a /home/dev)" = 700 ]
+				touch /home/dev/.cache-write
+				mkdir -p /home/dev/.local/state /home/dev/.atuin/data
+				touch /home/dev/.local/state/history /home/dev/.atuin/data/db
+			' || fail "Docker tmpfs UID:GID smoke test failed"
+	else
+		printf 'Skipping Docker tmpfs smoke: daemon available but image %s is not local (no pull attempted).\n' "$DOCKER_SMOKE_IMAGE"
+	fi
+else
+	printf 'Skipping Docker tmpfs smoke: no accessible Docker daemon.\n'
+fi
+
+printf 'All dotfiles image-build and runtime-home/shell tests passed.\n'
