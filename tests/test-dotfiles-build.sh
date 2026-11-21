@@ -5,11 +5,15 @@ set -eu
 REPO_ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 ORIGINAL_PATH=$PATH
 ORIGINAL_GIT=$(command -v git || true)
+PODMAN_SMOKE_NAMES=
 GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/sd-vpnc-dotfiles.XXXXXX")
 cleanup() {
+	for container_name in $PODMAN_SMOKE_NAMES; do
+		PATH="$ORIGINAL_PATH" podman rm --force "$container_name" >/dev/null 2>&1 || true
+	done
 	chmod -R u+rwx "$TMP_ROOT" 2>/dev/null || true
 	rm -rf "$TMP_ROOT"
 }
@@ -935,7 +939,7 @@ assert_contains "$(cat "$CASE_DIR/bash-args")" '--login'
 assert_contains "$(cat "$CASE_DIR/bash-args")" '-i'
 assert_contains "$(cat "$CASE_DIR/bash-hist")" '/.local/state/sd-vpnc/bash_history'
 
-# Fake runtime engines record both launch modes without changing /work or SSH.
+# Fake runtime engines record regular/detached launches and engine-specific bind behavior.
 RUNTIME_ENGINE_SCRIPT="$TMP_ROOT/runtime-engine"
 cat > "$RUNTIME_ENGINE_SCRIPT" <<'ENGINE'
 #!/bin/sh
@@ -944,6 +948,12 @@ printf '%s' "${0##*/}" >> "$RUNTIME_LOG"
 for argument do printf '[%s]' "$argument" >> "$RUNTIME_LOG"; done
 printf '\n' >> "$RUNTIME_LOG"
 case ${1:-} in
+	info)
+		case ${FAKE_ROOTLESS_STATUS:-false} in
+			error) exit 77 ;;
+			*) printf '%s\n' "${FAKE_ROOTLESS_STATUS:-false}"; exit 0 ;;
+		esac
+		;;
 	container)
 		case ${2:-} in
 			inspect)
@@ -969,6 +979,8 @@ ENGINE
 chmod +x "$RUNTIME_ENGINE_SCRIPT"
 prepare_runtime_cli_case() {
 	prepare_case "$1"
+	FAKE_ROOTLESS_STATUS=false
+	export FAKE_ROOTLESS_STATUS
 	mkdir -p "$CASE_HOME/.config/sd-vpnc" "$CASE_HOME/.ssh" "$CASE_HOME/.local/share/sd-vpnc"
 	: > "$CASE_HOME/.config/sd-vpnc/client.ovpn"
 	RUNTIME_LOG="$CASE_DIR/runtime.log"
@@ -1002,29 +1014,74 @@ run_runtime_cli() {
 }
 uid=$(id -u)
 gid=$(id -g)
-prepare_runtime_cli_case runtime-podman-regular
+prepare_runtime_cli_case runtime-rootless-podman-regular
 make_runtime_podman_path
-output=$(run_runtime_cli ssh 2>&1) || fail "Podman regular runtime argument test failed: $output"
+FAKE_ROOTLESS_STATUS=true
+output=$(run_runtime_cli ssh 2>&1) || fail "rootless Podman regular runtime argument test failed: $output"
 runtime_args=$(cat "$RUNTIME_LOG")
 assert_contains "$runtime_args" "[--user][$uid:$gid]"
+assert_contains "$runtime_args" '[--userns=keep-id]'
 assert_contains "$runtime_args" '[--mount][type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup]'
+assert_contains "$runtime_args" "[$CASE_HOME/.config/sd-vpnc:/config:ro,z]"
+assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro,z]"
+assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work:z]"
+assert_contains "$runtime_args" "[info][--format][{{.Host.Security.Rootless}}]"
+
+prepare_runtime_cli_case runtime-rootless-podman-detached
+make_runtime_podman_path
+FAKE_ROOTLESS_STATUS=true
+output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "rootless Podman detached runtime argument test failed: $output"
+runtime_args=$(cat "$RUNTIME_LOG")
+assert_contains "$runtime_args" '[--detach]'
+assert_contains "$runtime_args" '[--userns=keep-id]'
+assert_contains "$runtime_args" '[--mount][type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup]'
+assert_contains "$runtime_args" "[$CASE_HOME/.config/sd-vpnc:/config:ro,z]"
+assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro,z]"
+assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work:z]"
+
+prepare_runtime_cli_case runtime-rootful-podman-regular
+make_runtime_podman_path
+output=$(run_runtime_cli ssh 2>&1) || fail "rootful Podman regular runtime argument test failed: $output"
+runtime_args=$(cat "$RUNTIME_LOG")
+assert_contains "$runtime_args" "[--user][$uid:$gid]"
+assert_not_contains "$runtime_args" '--userns=keep-id'
+assert_contains "$runtime_args" "[$CASE_HOME/.config/sd-vpnc:/config:ro]"
 assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
 assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+assert_not_contains "$runtime_args" ':ro,z'
+assert_not_contains "$runtime_args" ':/work:z'
+
+prepare_runtime_cli_case runtime-rootful-podman-detached
+make_runtime_podman_path
+output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "rootful Podman detached runtime argument test failed: $output"
+runtime_args=$(cat "$RUNTIME_LOG")
+assert_contains "$runtime_args" '[--detach]'
 assert_not_contains "$runtime_args" '--userns=keep-id'
+assert_contains "$runtime_args" "[$CASE_HOME/.config/sd-vpnc:/config:ro]"
+assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
+assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+assert_not_contains "$runtime_args" ':ro,z'
+assert_not_contains "$runtime_args" ':/work:z'
+
+prepare_runtime_cli_case runtime-podman-probe-error
+make_runtime_podman_path
+FAKE_ROOTLESS_STATUS=error
+if output=$(run_runtime_cli ssh 2>&1); then fail "Podman rootless probe error unexpectedly succeeded"; fi
+assert_contains "$output" 'Failed to determine whether Podman is rootless.'
+assert_not_contains "$(cat "$RUNTIME_LOG")" '[run]'
+
+prepare_runtime_cli_case runtime-podman-probe-invalid
+make_runtime_podman_path
+FAKE_ROOTLESS_STATUS=unknown
+if output=$(run_runtime_cli tun smoke-host 8080:80 2>&1); then fail "invalid Podman rootless probe unexpectedly succeeded"; fi
+assert_contains "$output" 'Podman rootless detection returned an invalid result'
+assert_not_contains "$(cat "$RUNTIME_LOG")" '[run]'
 
 prepare_runtime_cli_case runtime-podman-host-shell
 make_runtime_podman_path
+FAKE_ROOTLESS_STATUS=true
 output=$(run_runtime_cli ssh remote-host 2>&1) || fail "remote SSH host argument test failed: $output"
 assert_contains "$(cat "$RUNTIME_LOG")" '[ssh][remote-host]'
-
-prepare_runtime_cli_case runtime-podman-detached
-make_runtime_podman_path
-output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "Podman detached runtime argument test failed: $output"
-runtime_args=$(cat "$RUNTIME_LOG")
-assert_contains "$runtime_args" '[--detach]'
-assert_contains "$runtime_args" '[--mount][type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup]'
-assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
-assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
 
 prepare_runtime_cli_case runtime-docker-regular
 make_runtime_docker_path
@@ -1032,8 +1089,12 @@ output=$(run_runtime_cli ssh 2>&1) || fail "Docker regular runtime argument test
 runtime_args=$(cat "$RUNTIME_LOG")
 assert_contains "$runtime_args" "[--user][$uid:$gid]"
 assert_contains "$runtime_args" "[--tmpfs][/home/dev:rw,uid=$uid,gid=$gid,mode=0700]"
+assert_contains "$runtime_args" "[$CASE_HOME/.config/sd-vpnc:/config:ro]"
 assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
 assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+assert_not_contains "$runtime_args" 'info][--format'
+assert_not_contains "$runtime_args" ':ro,z'
+assert_not_contains "$runtime_args" ':/work:z'
 
 prepare_runtime_cli_case runtime-docker-detached
 make_runtime_docker_path
@@ -1041,8 +1102,12 @@ output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "Docker detached r
 runtime_args=$(cat "$RUNTIME_LOG")
 assert_contains "$runtime_args" '[--detach]'
 assert_contains "$runtime_args" "[--tmpfs][/home/dev:rw,uid=$uid,gid=$gid,mode=0700]"
+assert_contains "$runtime_args" "[$CASE_HOME/.config/sd-vpnc:/config:ro]"
 assert_contains "$runtime_args" "[$CASE_HOME/.ssh:/home/dev/.ssh:ro]"
 assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
+assert_not_contains "$runtime_args" 'info][--format'
+assert_not_contains "$runtime_args" ':ro,z'
+assert_not_contains "$runtime_args" ':/work:z'
 
 # Existing-container `shell` execs the same selector used by the entrypoint.
 prepare_runtime_cli_case runtime-shell-exec
@@ -1062,7 +1127,7 @@ if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
 		mkdir -m 0755 "$HOST_SSH"
 		printf 'host ssh config\n' > "$HOST_SSH/config"
 		chmod 0644 "$HOST_SSH/config"
-		podman run --rm --user 12345:6789 \
+		podman run --rm --pull=never --user 12345:6789 \
 			--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
 			-v "$HOME_INIT_FILE:/tmp/home-init.sh:ro,Z" \
 			-v "$HOME_TEMPLATE:/tmp/home-template:ro,Z" \
@@ -1084,7 +1149,7 @@ if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
 				touch /home/dev/.cache/new
 				touch /home/dev/.local/state/history /home/dev/.atuin/data/db
 			' || fail "rootless Podman home seeding and UID:GID smoke test failed"
-		podman run --rm --user 12345:6789 \
+		podman run --rm --pull=never --user 12345:6789 \
 			--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
 			-e HOME=/home/dev --entrypoint /bin/sh "$PODMAN_SMOKE_IMAGE" -c '
 				[ ! -e /home/dev/.local/state/history ]
@@ -1097,7 +1162,7 @@ if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
 		APP_VERSION=$(sed -n 's/^VERSION=//p' "$REPO_ROOT/sd-vpnc" | head -n 1)
 		APP_IMAGE="localhost/sd-vpnc:$APP_VERSION"
 		if podman image inspect "$APP_IMAGE" >/dev/null 2>&1; then
-			if podman run --rm --user 12345:6789 \
+			if podman run --rm --pull=never --user 12345:6789 \
 				--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true \
 				--entrypoint /bin/sh "$APP_IMAGE" -c '
 				set -e
@@ -1111,7 +1176,7 @@ if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
 					exit 1
 				fi
 			'; then
-				podman run --rm --user 12345:6789 \
+				podman run --rm --pull=never --user 12345:6789 \
 					--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
 					-e HOME=/home/dev --entrypoint /bin/bash "$APP_IMAGE" -c '
 						set -euo pipefail
@@ -1132,10 +1197,108 @@ if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
 else
 	printf 'Skipping Podman home smoke: no accessible Podman engine.\n'
 fi
+
+# Exercise the accepted rootless bind strategy against the local application
+# image only. These mode-0700 host sources reproduce the private user-owned
+# directories reported by the user; the two-container case keeps both mounts
+# active together so shared :z labels are tested, not just generated.
+if command -v podman >/dev/null 2>&1; then
+	if ROOTLESS_STATUS=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null) && [ "$ROOTLESS_STATUS" = true ]; then
+		APP_VERSION=$(sed -n 's/^VERSION=//p' "$REPO_ROOT/sd-vpnc" | head -n 1)
+		APP_IMAGE="localhost/sd-vpnc:$APP_VERSION"
+		if podman image inspect "$APP_IMAGE" >/dev/null 2>&1; then
+			ROOTLESS_SMOKE_ROOT="$TMP_ROOT/rootless-host-mounts"
+			ROOTLESS_CONFIG="$ROOTLESS_SMOKE_ROOT/config"
+			ROOTLESS_SSH="$ROOTLESS_SMOKE_ROOT/ssh"
+			ROOTLESS_WORK="$ROOTLESS_SMOKE_ROOT/work"
+			mkdir -p "$ROOTLESS_CONFIG" "$ROOTLESS_SSH" "$ROOTLESS_WORK"
+			chmod 700 "$ROOTLESS_SMOKE_ROOT" "$ROOTLESS_CONFIG" "$ROOTLESS_SSH" "$ROOTLESS_WORK"
+			printf 'rootless smoke VPN config\n' > "$ROOTLESS_CONFIG/client.ovpn"
+			printf 'rootless smoke credentials\n' > "$ROOTLESS_CONFIG/credentials"
+			printf 'Host rootless-smoke\n' > "$ROOTLESS_SSH/config"
+			chmod 600 "$ROOTLESS_CONFIG/client.ovpn" "$ROOTLESS_CONFIG/credentials" "$ROOTLESS_SSH/config"
+			ROOTLESS_UID=$(id -u)
+			ROOTLESS_GID=$(id -g)
+
+			podman run --rm --pull=never --userns=keep-id --user "$ROOTLESS_UID:$ROOTLESS_GID" \
+				--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
+				-v "$ROOTLESS_CONFIG:/config:ro,z" \
+				-v "$ROOTLESS_SSH:/home/dev/.ssh:ro,z" \
+				-v "$ROOTLESS_WORK:/work:z" \
+				-e HOME=/home/dev -e ROOTLESS_UID="$ROOTLESS_UID" -e ROOTLESS_GID="$ROOTLESS_GID" \
+				--workdir /home/dev --entrypoint /bin/bash "$APP_IMAGE" -c '
+					set -euo pipefail
+					. /usr/local/lib/sd-vpnc-home-init.sh
+					seed_template="/tmp/sd-vpnc-seed-$$"
+					mkdir -m 0700 "$seed_template"
+					printf "seeded home entry\\n" > "$seed_template/seed-probe"
+					sd_vpnc_seed_home "$seed_template"
+					[ "$(stat -c %u:%g /home/dev)" = "$ROOTLESS_UID:$ROOTLESS_GID" ]
+					[ "$(stat -c %a /home/dev)" = 700 ]
+					[ "$(cat /home/dev/seed-probe)" = "seeded home entry" ]
+					[ "$(stat -c %u:%g /home/dev/seed-probe)" = "$ROOTLESS_UID:$ROOTLESS_GID" ]
+					[ "$(cat /config/client.ovpn)" = "rootless smoke VPN config" ]
+					[ "$(cat /config/credentials)" = "rootless smoke credentials" ]
+					[ "$(cat /home/dev/.ssh/config)" = "Host rootless-smoke" ]
+					if touch /config/write-probe 2>/dev/null; then exit 1; fi
+					if touch /home/dev/.ssh/write-probe 2>/dev/null; then exit 1; fi
+					touch /work/single-container-probe
+					[ "$(stat -c %u:%g /work/single-container-probe)" = "$ROOTLESS_UID:$ROOTLESS_GID" ]
+					rm -rf "$seed_template"
+				' || fail "rootless Podman config/SSH/work/home tmpfs smoke failed"
+			[ "$(stat -c %u:%g "$ROOTLESS_WORK/single-container-probe")" = "$ROOTLESS_UID:$ROOTLESS_GID" ] || fail "rootless Podman /work file has unexpected host ownership"
+
+			ROOTLESS_OVERLAP_ONE="sd-vpnc-overlap-one-$$"
+			ROOTLESS_OVERLAP_TWO="sd-vpnc-overlap-two-$$"
+			PODMAN_SMOKE_NAMES="$PODMAN_SMOKE_NAMES $ROOTLESS_OVERLAP_ONE $ROOTLESS_OVERLAP_TWO"
+			for container_name in "$ROOTLESS_OVERLAP_ONE" "$ROOTLESS_OVERLAP_TWO"; do
+				podman run --pull=never --detach --name "$container_name" \
+					--userns=keep-id --user "$ROOTLESS_UID:$ROOTLESS_GID" \
+					--mount type=tmpfs,destination=/home/dev,tmpfs-mode=0700,U=true,notmpcopyup \
+					-v "$ROOTLESS_CONFIG:/config:ro,z" \
+					-v "$ROOTLESS_SSH:/home/dev/.ssh:ro,z" \
+					-v "$ROOTLESS_WORK:/work:z" \
+					-e HOME=/home/dev --workdir /home/dev --entrypoint /bin/bash "$APP_IMAGE" -c 'sleep 300' \
+					>/dev/null || fail "could not start overlapping rootless Podman smoke container"
+			done
+			check_overlap_container() {
+				container_name=$1
+				marker=$2
+				podman exec --user "$ROOTLESS_UID:$ROOTLESS_GID" "$container_name" /bin/bash -ceu '
+					[ "$(cat /config/client.ovpn)" = "rootless smoke VPN config" ]
+					[ "$(cat /config/credentials)" = "rootless smoke credentials" ]
+					[ "$(cat /home/dev/.ssh/config)" = "Host rootless-smoke" ]
+					if touch /config/write-probe 2>/dev/null; then exit 1; fi
+					if touch /home/dev/.ssh/write-probe 2>/dev/null; then exit 1; fi
+					touch "/work/$1"
+					[ "$(stat -c %u:%g "/work/$1")" = "$2:$3" ]
+				' overlap-smoke "$marker" "$ROOTLESS_UID" "$ROOTLESS_GID" || fail "overlapping rootless Podman container could not use shared :z mounts"
+			}
+			check_overlap_container "$ROOTLESS_OVERLAP_ONE" overlap-one
+			check_overlap_container "$ROOTLESS_OVERLAP_TWO" overlap-two
+			for container_name in "$ROOTLESS_OVERLAP_ONE" "$ROOTLESS_OVERLAP_TWO"; do
+				[ "$(podman container inspect --format '{{.State.Running}}' "$container_name")" = true ] || fail "overlapping rootless Podman smoke container exited early"
+			done
+			[ "$(stat -c %u:%g "$ROOTLESS_WORK/overlap-one")" = "$ROOTLESS_UID:$ROOTLESS_GID" ] || fail "first overlapping /work write has unexpected host ownership"
+			[ "$(stat -c %u:%g "$ROOTLESS_WORK/overlap-two")" = "$ROOTLESS_UID:$ROOTLESS_GID" ] || fail "second overlapping /work write has unexpected host ownership"
+			if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null || true)" = Enforcing ]; then
+				printf 'Rootless Podman overlapping shared-mount smoke passed with SELinux Enforcing.\n'
+			else
+				printf 'Rootless Podman overlapping shared-mount smoke passed; SELinux Enforcing-specific validation unavailable.\n'
+			fi
+		else
+			printf 'Skipping rootless Podman bind smokes: local app image %s is unavailable (no pull attempted).\n' "$APP_IMAGE"
+		fi
+	else
+		printf 'Skipping rootless Podman bind smokes: no rootless Podman engine.\n'
+	fi
+else
+	printf 'Skipping rootless Podman bind smokes: Podman is unavailable.\n'
+fi
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
 	DOCKER_SMOKE_IMAGE=${SD_VPNC_DOCKER_SMOKE_IMAGE:-busybox:latest}
 	if docker image inspect "$DOCKER_SMOKE_IMAGE" >/dev/null 2>&1; then
-		docker run --rm --user 12345:6789 \
+		docker run --rm --pull=never --user 12345:6789 \
 			--tmpfs /home/dev:rw,uid=12345,gid=6789,mode=0700 \
 			--entrypoint sh "$DOCKER_SMOKE_IMAGE" -c '
 				[ "$(stat -c %u:%g /home/dev)" = 12345:6789 ]

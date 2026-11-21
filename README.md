@@ -242,21 +242,46 @@ change the current directory of its parent shell.
 - Permission to run containers with `NET_ADMIN`
 - An OpenVPN provider configuration
 
-The container runs with the invoking host UID/GID so files in the mounted work
-directory and SSH directory retain normal host ownership. The image itself is
-not built with a host-specific UID or GID. `/work` is mounted from the host;
-the host's SSH directory is mounted read-only at `/home/dev/.ssh`, masking any
-image content at that path.
+The runtime process uses the invoking host UID:GID, and runtime files in `/work`
+retain that host ownership. The image is not built with host-specific UID/GID
+arguments. `/work` is mounted from the host; the host's SSH directory is
+mounted read-only at `/home/dev/.ssh`, masking any image content at that path.
 
-The baked `/home/dev` and `/home/dev/.dotfiles` remain root-owned in the image,
-and the image is not built with host-specific UID/GID arguments. At runtime, a
-private mode-0700 tmpfs overlays `/home/dev` and is owned by the invoking
-numeric UID:GID. Podman uses tmpfs `U=true,notmpcopyup` to set ownership without
-copying baked root-owned children into the tmpfs; this lets the runtime seed
-replace an image-owned `/home/dev/.config/atuin` directory with a runtime-owned
-one. Docker uses tmpfs `uid`, `gid`, and `mode` options. Neither approach
-changes the container's UID mapping, and no world-writable mode or image-home
-ownership/permission rewrite is used.
+The baked `/home/dev` and `/home/dev/.dotfiles` remain root-owned in the image.
+At runtime, a private mode-0700 tmpfs overlays `/home/dev` and is owned by the
+invoking numeric UID:GID. Podman uses tmpfs `U=true,notmpcopyup` to set the
+home mount's ownership without copying baked root-owned children into it;
+Docker uses tmpfs `uid`, `gid`, and `mode` options. **Home tmpfs ownership by
+itself does not change a container's UID mapping.** For rootless Podman only,
+`sd-vpnc` also uses `--userns=keep-id` while retaining `--user UID:GID`; this
+changes the mapping for the entire container so the configured runtime user
+maps to the invoking host identity and can traverse the private host bind
+sources. This is distinct from the home tmpfs ownership behavior. Rootful
+Podman and Docker retain their existing user-namespace behavior; rootless Docker
+is unsupported by this rootless mount-access behavior. No world-writable mode,
+build-time host UID/GID argument, or image-home ownership/permission rewrite is
+used.
+
+Rootless Podman uses shared `:z` relabeling on the host configuration directory
+mounted read-only at `/config`, the host SSH directory mounted read-only at
+`/home/dev/.ssh`, and the writable host work directory mounted at `/work`. The
+shared label is needed because regular and detached containers may overlap and
+use the same sources; a private `:Z` label would conflict. This persistently
+relabels all three source trees and their contents, including SSH files and VPN
+configuration and credentials. The shared label broadens SELinux access to
+`container_t` domains, while SELinux confinement remains enabled and config/SSH
+remain read-only inside the container.
+
+To restore the host policy-default labels after use, run `restorecon -Rv` on the
+actual configuration directory, SSH directory, and selected work directory. For
+the defaults (replace the final path when using `-C`/`--workdir`):
+
+```sh
+restorecon -Rv \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/sd-vpnc" \
+  "${SD_VPNC_SSH_CONFIG:-$HOME/.ssh}" \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/sd-vpnc"
+```
 
 After the root installer and temporary `.git` cleanup, a separate image template
 is made from the baked home without `.ssh`. At startup, readable ordinary files
@@ -279,9 +304,9 @@ history, and Atuin data are session-only and disappear when the container
 stops. Rebuild the image to refresh the baked home template; no `chown` or
 `chmod` is applied to image home content.
 
-The host's SSH directory is still mounted read-only at `/home/dev/.ssh`,
-masking any image content there, and the host work directory remains mounted
-writable at `/work`.
+The host's SSH directory is mounted read-only at `/home/dev/.ssh`, masking any
+image content there; the host configuration directory is read-only at `/config`,
+and the host work directory is writable at `/work`.
 
 ## Security
 
@@ -325,11 +350,16 @@ check the following before relying on the setup:
   modes remain unchanged. Confirm Zsh/Bash history and Atuin data point into the
   writable session paths, while `.ssh` remains read-only and `/work` is
   unchanged.
-- Check the generated Podman and Docker tmpfs arguments with fake engines. When
-  an accessible Docker daemon and local smoke-test image are available,
-  conditionally run a tmpfs ownership and write smoke test. Do not pull an image
-  as part of the test; skip with a clear message if either prerequisite is
-  missing.
+- Check generated rootless/rootful Podman and Docker runtime arguments with fake
+  engines for regular and detached launches, including rootless-detection
+  failures. When rootless Podman and a local `localhost/sd-vpnc:$VERSION` image
+  are available, conditionally test private host config/SSH/work directories,
+  read-only config/SSH access, writable host-owned `/work` files, and home tmpfs
+  ownership/seeding. Also overlap two containers using the same `:z` sources
+  and verify both retain access, including under SELinux Enforcing when
+  available. Do not pull images; skip with a clear message if prerequisites
+  are missing. When an accessible Docker daemon and local smoke-test image are
+  available, conditionally run its existing tmpfs ownership/write smoke.
 - When a local `localhost/sd-vpnc:$VERSION` image contains a root-owned
   `/home/dev/.config/atuin`, conditionally verify the default Podman tmpfs
   copy-up leaves it non-writable to the runtime UID, then verify
