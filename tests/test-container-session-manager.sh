@@ -294,7 +294,7 @@ run_cli() {
 
 lease_count() {
 	count=0
-	for lease in "$ENGINE_STATE"/containers/sd-vpnc-$(id -u)/lease.*; do
+	for lease in "$ENGINE_STATE/containers/sd-vpnc-$(id -u)"/lease.*; do
 		[ -f "$lease" ] || continue
 		count=$((count + 1))
 	done
@@ -348,7 +348,7 @@ wait_for_file() {
 lease_id_at() {
 	wanted=$1
 	index=0
-	for lease in "$ENGINE_STATE"/containers/sd-vpnc-$(id -u)/lease.*; do
+	for lease in "$ENGINE_STATE/containers/sd-vpnc-$(id -u)"/lease.*; do
 		[ -f "$lease" ] || continue
 		if [ "$index" -eq "$wanted" ]; then printf '%s\n' "${lease##*.}"; return 0; fi
 		index=$((index + 1))
@@ -544,7 +544,7 @@ wait_for_session_count 2
 attempt=0
 attach_id=
 while [ -z "$attach_id" ] && [ "$attempt" -lt 100 ]; do
-	for lease in "$ENGINE_STATE"/containers/sd-vpnc-$(id -u)/lease.*; do
+	for lease in "$ENGINE_STATE/containers/sd-vpnc-$(id -u)"/lease.*; do
 		[ -f "$lease" ] || continue
 		candidate=${lease##*.}
 		[ "$candidate" = "$first_race_id" ] || { attach_id=$candidate; break; }
@@ -816,7 +816,7 @@ make_engine_path
 NO_FLOCK_BIN=$CASE_DIR/no-flock-bin
 mkdir -p "$NO_FLOCK_BIN"
 cp "$ENGINE_BIN/podman" "$NO_FLOCK_BIN/podman"
-for utility in id; do ln -s "$(command -v "$utility")" "$NO_FLOCK_BIN/$utility"; done
+ln -s "$(command -v id)" "$NO_FLOCK_BIN/id"
 if output=$(PATH=$NO_FLOCK_BIN HOME=$CASE_HOME XDG_CONFIG_HOME=$CASE_HOME/.config \
 	XDG_DATA_HOME=$CASE_HOME/.local/share XDG_STATE_HOME=$CASE_STATE \
 	SD_VPNC_COLOR=never "$REPO_ROOT/sd-vpnc" ssh 2>&1); then fail 'managed request worked without flock'; fi
