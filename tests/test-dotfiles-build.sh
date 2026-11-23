@@ -979,6 +979,7 @@ ENGINE
 chmod +x "$RUNTIME_ENGINE_SCRIPT"
 prepare_runtime_cli_case() {
 	prepare_case "$1"
+	unset DEVPOD_WORKSPACE_ID DEVPOD_WORKSPACE_ID_OTHER DEVPOD_WORKSPACE SD_VPNC_FORWARD_CANARY
 	FAKE_ROOTLESS_STATUS=false
 	export FAKE_ROOTLESS_STATUS
 	mkdir -p "$CASE_HOME/.config/sd-vpnc" "$CASE_HOME/.ssh" "$CASE_HOME/.local/share/sd-vpnc"
@@ -1108,6 +1109,85 @@ assert_contains "$runtime_args" "[$CASE_HOME/.local/share/sd-vpnc:/work]"
 assert_not_contains "$runtime_args" 'info][--format'
 assert_not_contains "$runtime_args" ':ro,z'
 assert_not_contains "$runtime_args" ':/work:z'
+
+# DEVPOD_WORKSPACE_ID is the only host variable forwarded, and only when non-empty.
+assert_devpod_forwarded() {
+	assert_contains "$runtime_args" '[-e][HOME=/home/dev][-e][DEVPOD_WORKSPACE_ID=devpod workspace;id][-v]'
+	assert_not_contains "$runtime_args" 'DEVPOD_WORKSPACE_ID_OTHER'
+	assert_not_contains "$runtime_args" 'SD_VPNC_FORWARD_CANARY'
+	assert_not_contains "$runtime_args" 'canary-value'
+	assert_not_contains "$runtime_args" 'other-value'
+}
+assert_devpod_not_forwarded() {
+	assert_contains "$runtime_args" '[-e][HOME=/home/dev]'
+	assert_not_contains "$runtime_args" 'DEVPOD_WORKSPACE_ID'
+	assert_not_contains "$runtime_args" 'DEVPOD_WORKSPACE'
+	assert_not_contains "$runtime_args" 'SD_VPNC_FORWARD_CANARY'
+	assert_not_contains "$runtime_args" '[-e][-v]'
+	assert_contains "$runtime_args" '[-e][HOME=/home/dev][-v]'
+}
+set_devpod_environment() {
+	DEVPOD_WORKSPACE_ID='devpod workspace;id'
+	DEVPOD_WORKSPACE_ID_OTHER=other-value
+	SD_VPNC_FORWARD_CANARY=canary-value
+	export DEVPOD_WORKSPACE_ID DEVPOD_WORKSPACE_ID_OTHER SD_VPNC_FORWARD_CANARY
+}
+
+for engine in podman docker; do
+	prepare_runtime_cli_case "runtime-$engine-devpod-regular-set"
+	"make_runtime_${engine}_path"
+	set_devpod_environment
+	output=$(run_runtime_cli ssh 2>&1) || fail "$engine regular DEVPOD_WORKSPACE_ID forwarding failed: $output"
+	runtime_args=$(cat "$RUNTIME_LOG")
+	assert_devpod_forwarded
+
+	prepare_runtime_cli_case "runtime-$engine-devpod-detached-set"
+	"make_runtime_${engine}_path"
+	set_devpod_environment
+	output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "$engine detached DEVPOD_WORKSPACE_ID forwarding failed: $output"
+	runtime_args=$(cat "$RUNTIME_LOG")
+	assert_contains "$runtime_args" '[--detach]'
+	assert_devpod_forwarded
+
+	prepare_runtime_cli_case "runtime-$engine-devpod-regular-unset"
+	"make_runtime_${engine}_path"
+	DEVPOD_WORKSPACE_ID_OTHER=other-value
+	SD_VPNC_FORWARD_CANARY=canary-value
+	DEVPOD_WORKSPACE=workspace-value
+	export DEVPOD_WORKSPACE_ID_OTHER SD_VPNC_FORWARD_CANARY DEVPOD_WORKSPACE
+	output=$(run_runtime_cli ssh 2>&1) || fail "$engine regular unset DEVPOD_WORKSPACE_ID failed: $output"
+	runtime_args=$(cat "$RUNTIME_LOG")
+	assert_devpod_not_forwarded
+
+	prepare_runtime_cli_case "runtime-$engine-devpod-detached-unset"
+	"make_runtime_${engine}_path"
+	DEVPOD_WORKSPACE_ID_OTHER=other-value
+	SD_VPNC_FORWARD_CANARY=canary-value
+	DEVPOD_WORKSPACE=workspace-value
+	export DEVPOD_WORKSPACE_ID_OTHER SD_VPNC_FORWARD_CANARY DEVPOD_WORKSPACE
+	output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "$engine detached unset DEVPOD_WORKSPACE_ID failed: $output"
+	runtime_args=$(cat "$RUNTIME_LOG")
+	assert_contains "$runtime_args" '[--detach]'
+	assert_devpod_not_forwarded
+
+	prepare_runtime_cli_case "runtime-$engine-devpod-regular-empty"
+	"make_runtime_${engine}_path"
+	DEVPOD_WORKSPACE_ID=
+	export DEVPOD_WORKSPACE_ID
+	output=$(run_runtime_cli ssh 2>&1) || fail "$engine regular empty DEVPOD_WORKSPACE_ID failed: $output"
+	runtime_args=$(cat "$RUNTIME_LOG")
+	assert_devpod_not_forwarded
+
+	prepare_runtime_cli_case "runtime-$engine-devpod-detached-empty"
+	"make_runtime_${engine}_path"
+	DEVPOD_WORKSPACE_ID=
+	export DEVPOD_WORKSPACE_ID
+	output=$(run_runtime_cli tun smoke-host 8080:80 2>&1) || fail "$engine detached empty DEVPOD_WORKSPACE_ID failed: $output"
+	runtime_args=$(cat "$RUNTIME_LOG")
+	assert_contains "$runtime_args" '[--detach]'
+	assert_devpod_not_forwarded
+done
+unset DEVPOD_WORKSPACE_ID DEVPOD_WORKSPACE_ID_OTHER DEVPOD_WORKSPACE SD_VPNC_FORWARD_CANARY
 
 # Existing-container `shell` execs the same selector used by the entrypoint.
 prepare_runtime_cli_case runtime-shell-exec
