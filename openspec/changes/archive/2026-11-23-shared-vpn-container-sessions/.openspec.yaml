@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-11-23
+goal: Share one persistent VPN manager container across regular shell, SSH, and SSH-tmux sessions, with race-safe leases, last-session shutdown, and conservative recovery.

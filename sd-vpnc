@@ -227,6 +227,7 @@ RUN dnf -y install \
       openvpn \
       procps-ng \
       tmux \
+      util-linux \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
@@ -235,7 +236,8 @@ RUN mkdir -p /config /home/dev /work && chmod 0755 /home/dev
 COPY entrypoint.sh /usr/local/bin/sd-vpnc-entrypoint
 COPY home-init.sh /usr/local/lib/sd-vpnc-home-init.sh
 COPY sd-vpnc-shell /usr/local/bin/sd-vpnc-shell
-RUN chmod 0755 /usr/local/bin/sd-vpnc-entrypoint /usr/local/bin/sd-vpnc-shell
+COPY sd-vpnc-session-registry /usr/local/bin/sd-vpnc-session-registry
+RUN chmod 0755 /usr/local/bin/sd-vpnc-entrypoint /usr/local/bin/sd-vpnc-shell /usr/local/bin/sd-vpnc-session-registry
 
 ENV HOME=/home/dev \
     XDG_CACHE_HOME=/home/dev/.cache \
@@ -250,6 +252,27 @@ CONTAINERFILE
 #!/usr/bin/env bash
 set -euo pipefail
 
+mode=${1:-shell}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$mode" in
+  session)
+    exec /usr/local/bin/sd-vpnc-session-registry launch "$@"
+    ;;
+  status|ready)
+    exec /usr/local/bin/sd-vpnc-session-registry "$mode"
+    ;;
+  manager|ssh|ssh-tmux|tun) ;;
+  *) echo "Unknown container command: $mode" >&2; exit 2 ;;
+esac
+
+if [[ "$mode" == manager ]]; then
+  rm -f /tmp/sd-vpnc-manager-ready /tmp/sd-vpnc-vpn-ready
+  /usr/local/bin/sd-vpnc-session-registry initialize
+fi
+
 . /usr/local/lib/sd-vpnc-home-init.sh
 sd_vpnc_seed_home /usr/share/sd-vpnc/home-template
 
@@ -259,28 +282,18 @@ vpn_config=/tmp/client.ovpn
 pidfile=/tmp/openvpn.pid
 logfile=/tmp/openvpn.log
 
-# Podman derives the runtime user's passwd home from the container workdir.
-# Start there as /home/dev so OpenSSH expands ~/.ssh correctly, then use the
-# mounted project directory as the actual working directory.
 cd /work
-
 if [[ ! -r "$config" ]]; then
   echo "VPN configuration not found: $config" >&2
   echo "Create ~/.config/sd-vpnc/client.ovpn or set SD_VPNC_CONFIG." >&2
   exit 1
 fi
-
 cp "$config" "$vpn_config"
 if [[ -r "$credentials" ]]; then
   printf '\nauth-user-pass %s\n' "$credentials" >> "$vpn_config"
 fi
 
-openvpn \
-  --config "$vpn_config" \
-  --daemon vpn-ssh-openvpn \
-  --writepid "$pidfile" \
-  --log "$logfile"
-
+openvpn --config "$vpn_config" --daemon vpn-ssh-openvpn --writepid "$pidfile" --log "$logfile"
 cleanup() {
   if [[ -n "${ssh_pid:-}" ]]; then
     kill "$ssh_pid" 2>/dev/null || true
@@ -289,12 +302,11 @@ cleanup() {
     kill "$(<"$pidfile")" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 for _ in {1..60}; do
-  if compgen -G '/sys/class/net/tun*' >/dev/null; then
-    break
-  fi
+  if compgen -G '/sys/class/net/tun*' >/dev/null; then break; fi
   if [[ -s "$pidfile" ]] && ! kill -0 "$(<"$pidfile")" 2>/dev/null; then
     echo "OpenVPN failed to start:" >&2
     cat "$logfile" >&2 || true
@@ -302,126 +314,359 @@ for _ in {1..60}; do
   fi
   sleep 1
 done
-
 if ! compgen -G '/sys/class/net/tun*' >/dev/null; then
   echo "Timed out waiting for the VPN tunnel." >&2
   cat "$logfile" >&2 || true
   exit 1
 fi
-
 touch /tmp/sd-vpnc-vpn-ready
 
-mode=${1:-shell}
-if [[ $# -gt 0 ]]; then
-  shift
-fi
 ssh_args=()
-if [[ -f "$HOME/.ssh/config" ]]; then
-  ssh_args=(-F "$HOME/.ssh/config")
-fi
-
-case "$mode" in
-  ssh)
-    if [[ $# -gt 0 ]]; then
-      ssh "${ssh_args[@]}" "$@"
-    else
-      echo "VPN is connected. OpenVPN log: $logfile"
-      /usr/local/bin/sd-vpnc-shell
-    fi
-    ;;
-  ssh-tmux)
-    host=${1:-}
-    session=${2:-}
-    if [[ -z "$host" ]]; then
-      echo "A host is required for ssh-tmux." >&2
-      exit 2
-    fi
-    if [[ -n "$session" && ! "$session" =~ ^[[:alnum:]_.-]+$ ]]; then
-      echo "tmux session names may contain only letters, numbers, ., _, and -." >&2
-      exit 2
-    fi
-    if [[ -n "$session" ]]; then
-      ssh "${ssh_args[@]}" "$host" -t "tmux new -s '$session' || tmux attach -t '$session'"
-    else
-      ssh "${ssh_args[@]}" "$host"
-    fi
-    ;;
-  tun)
-    host=${1:-}
-    if [[ -z "$host" ]]; then
-      echo "A host is required for tun." >&2
-      exit 2
-    fi
-    shift
-    tunnel_args=()
-    tunnel_ports=()
-    while [[ $# -gt 0 ]]; do
-      mapping=$1
+if [[ -f "$HOME/.ssh/config" ]]; then ssh_args=(-F "$HOME/.ssh/config"); fi
+run_client() {
+  case "$mode" in
+    ssh)
+      if [[ $# -gt 0 ]]; then
+        ssh "${ssh_args[@]}" "$@"
+      else
+        echo "VPN is connected. OpenVPN log: $logfile"
+        /usr/local/bin/sd-vpnc-shell
+      fi
+      ;;
+    ssh-tmux)
+      host=${1:-}
+      session=${2:-}
+      if [[ -z "$host" ]]; then echo "A host is required for ssh-tmux." >&2; return 2; fi
+      if [[ -n "$session" && ! "$session" =~ ^[[:alnum:]_.-]+$ ]]; then
+        echo "tmux session names may contain only letters, numbers, ., _, and -." >&2
+        return 2
+      fi
+      if [[ -n "$session" ]]; then
+        ssh "${ssh_args[@]}" "$host" -t "tmux new -s '$session' || tmux attach -t '$session'"
+      else
+        ssh "${ssh_args[@]}" "$host"
+      fi
+      ;;
+    tun)
+      host=${1:-}
+      if [[ -z "$host" ]]; then echo "A host is required for tun." >&2; return 2; fi
       shift
-      case $mapping in
-        *:*:*)
-          local_port=${mapping%%:*}
-          remainder=${mapping#*:}
-          remote_host=${remainder%:*}
-          remote_port=${remainder##*:}
-          ;;
-        *:*)
-          local_port=${mapping%%:*}
-          remote_host=localhost
-          remote_port=${mapping#*:}
-          ;;
-        *) echo "Invalid port mapping: $mapping" >&2; exit 2 ;;
-      esac
-      if [[ ! "$local_port" =~ ^[0-9]+$ || ! "$remote_port" =~ ^[0-9]+$ || ! "$remote_host" =~ ^[[:alnum:]._-]+$ ]]; then
-        echo "Invalid port mapping: $mapping" >&2
-        exit 2
-      fi
-      tunnel_args+=(-L "0.0.0.0:$local_port:$remote_host:$remote_port")
-      tunnel_ports+=("$local_port")
-    done
-    ssh_log=/tmp/sd-vpnc-tun-ssh.log
-    ssh -v -N -T \
-      -o BatchMode=yes \
-      -o ConnectTimeout=20 \
-      -o ExitOnForwardFailure=yes \
-      -o ServerAliveInterval=30 \
-      -o ServerAliveCountMax=3 \
-      "${ssh_args[@]}" "${tunnel_args[@]}" "$host" >"$ssh_log" 2>&1 &
-    ssh_pid=$!
-    for _ in {1..45}; do
-      if ! kill -0 "$ssh_pid" 2>/dev/null; then
-        ssh_status=0
-        wait "$ssh_pid" || ssh_status=$?
-        cat "$ssh_log" >&2
-        exit "$ssh_status"
-      fi
-      forwards_ready=1
-      for local_port in "${tunnel_ports[@]}"; do
-        if ! grep -Fq "Local forwarding listening on 0.0.0.0 port $local_port." "$ssh_log"; then
-          forwards_ready=0
-          break
+      tunnel_args=()
+      tunnel_ports=()
+      while [[ $# -gt 0 ]]; do
+        mapping=$1; shift
+        case $mapping in
+          *:*:*) local_port=${mapping%%:*}; remainder=${mapping#*:}; remote_host=${remainder%:*}; remote_port=${remainder##*:} ;;
+          *:*) local_port=${mapping%%:*}; remote_host=localhost; remote_port=${mapping#*:} ;;
+          *) echo "Invalid port mapping: $mapping" >&2; return 2 ;;
+        esac
+        if [[ ! "$local_port" =~ ^[0-9]+$ || ! "$remote_port" =~ ^[0-9]+$ || ! "$remote_host" =~ ^[[:alnum:]._-]+$ ]]; then
+          echo "Invalid port mapping: $mapping" >&2; return 2
         fi
+        tunnel_args+=(-L "0.0.0.0:$local_port:$remote_host:$remote_port")
+        tunnel_ports+=("$local_port")
       done
-      if [[ "$forwards_ready" = 1 ]]; then
-        touch /tmp/sd-vpnc-tun-ready
-        echo "SSH tunnel is ready on the published local port(s)."
-        wait "$ssh_pid"
-        exit $?
+      ssh_log=/tmp/sd-vpnc-tun-ssh.log
+      ssh -v -N -T -o BatchMode=yes -o ConnectTimeout=20 -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "${ssh_args[@]}" "${tunnel_args[@]}" "$host" >"$ssh_log" 2>&1 &
+      ssh_pid=$!
+      for _ in {1..45}; do
+        if ! kill -0 "$ssh_pid" 2>/dev/null; then
+          ssh_status=0; wait "$ssh_pid" || ssh_status=$?; cat "$ssh_log" >&2; return "$ssh_status"
+        fi
+        forwards_ready=1
+        for local_port in "${tunnel_ports[@]}"; do
+          if ! grep -Fq "Local forwarding listening on 0.0.0.0 port $local_port." "$ssh_log"; then forwards_ready=0; break; fi
+        done
+        if [[ "$forwards_ready" = 1 ]]; then
+          touch /tmp/sd-vpnc-tun-ready
+          echo "SSH tunnel is ready on the published local port(s)."
+          wait "$ssh_pid"
+          return $?
+        fi
+        sleep 1
+      done
+      echo "Timed out waiting for SSH tunnel setup." >&2
+      cat "$ssh_log" >&2 || true
+      kill "$ssh_pid" 2>/dev/null || true
+      wait "$ssh_pid" 2>/dev/null || true
+      return 1
+      ;;
+  esac
+}
+
+if [[ "$mode" == manager ]]; then
+  /usr/local/bin/sd-vpnc-session-registry start-grace
+  /usr/local/bin/sd-vpnc-session-registry watch &
+  watcher_pid=$!
+  /usr/local/bin/sd-vpnc-session-registry mark-ready
+  wait "$watcher_pid"
+  exit 0
+fi
+run_client "$@"
+ENTRYPOINT
+
+	cat >"$build_dir/sd-vpnc-session-registry" <<'REGISTRY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+runtime=${SD_VPNC_SESSION_RUNTIME:-/tmp/sd-vpnc-session-registry}
+lock_file=$runtime/registry.lock
+state_file=$runtime/state
+sessions=$runtime/sessions
+ready_file=/tmp/sd-vpnc-manager-ready
+
+proc_identity() {
+  local pid=$1 stat rest
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  IFS= read -r stat < "/proc/$pid/stat" || return 1
+  rest=${stat##*) }
+  [[ "$rest" != "$stat" ]] || return 1
+  # After the command name, field 20 is Linux /proc stat field 22 (starttime).
+  awk '{ print $20 }' <<<"$rest"
+}
+
+write_state() {
+  local state=$1 ever=$2 started=$3
+  printf '%s\n%s\n%s\n' "$state" "$ever" "$started" > "$runtime/state.tmp"
+  mv -f "$runtime/state.tmp" "$state_file"
+}
+
+read_state() {
+  state= ever= started=
+  [[ -r "$state_file" ]] || return 1
+  { IFS= read -r state; IFS= read -r ever; IFS= read -r started; } < "$state_file"
+  [[ -n "$state" && ( "$ever" == 0 || "$ever" == 1 ) && "$started" =~ ^[0-9]+$ ]]
+}
+
+# Run a state transition in a fresh process while holding the shared registry lock.
+locked() {
+  flock -x "$lock_file" "$0" "__locked-$1" "${@:2}"
+}
+
+classify_lease() {
+  local file=$1 id pid recorded_start recorded_generation current state
+  id=${file##*/}
+  if ! { IFS= read -r pid && IFS= read -r recorded_start && IFS= read -r recorded_generation; } < "$file"; then
+    printf 'indeterminate %s\n' "$id"; return
+  fi
+  if [[ ! "$pid" =~ ^[0-9]+$ || ! "$recorded_start" =~ ^[0-9]+$ || -z "$recorded_generation" ]]; then
+    printf 'indeterminate %s\n' "$id"; return
+  fi
+  if [[ "$recorded_generation" != "$generation" ]]; then
+    rm -f -- "$file"
+    printf 'stale %s\n' "$id"; return
+  fi
+  if [[ ! -d "/proc/$pid" ]]; then
+    rm -f -- "$file"
+    printf 'stale %s\n' "$id"; return
+  fi
+  if ! current=$(proc_identity "$pid" 2>/dev/null); then
+    printf 'indeterminate %s\n' "$id"; return
+  fi
+  IFS= read -r state < "/proc/$pid/stat" || { printf 'indeterminate %s\n' "$id"; return; }
+  state=${state##*) }
+  state=${state%% *}
+  if [[ "$state" == Z || "$current" != "$recorded_start" ]]; then
+    rm -f -- "$file"
+    printf 'stale %s\n' "$id"; return
+  fi
+  printf 'live %s\n' "$id"
+}
+
+reconcile_locked() {
+  local file result category id
+  live_count=0; stale_count=0; indeterminate_count=0; indeterminate_ids=
+  shopt -s nullglob
+  for file in "$sessions"/*; do
+    [[ -f "$file" ]] || continue
+    result=$(classify_lease "$file")
+    read -r category id <<<"$result"
+    case $category in
+      live) live_count=$((live_count + 1)) ;;
+      stale) stale_count=$((stale_count + 1)) ;;
+      *) indeterminate_count=$((indeterminate_count + 1)); indeterminate_ids+=" $id" ;;
+    esac
+  done
+  shopt -u nullglob
+}
+
+manager_transition_locked() {
+  local now elapsed already_reconciled=${1:-0}
+  read_state || return 1
+  now=$(date +%s)
+  if [[ "$state" == WAITING_FIRST_SESSION ]]; then
+    elapsed=$((now - started))
+    if [[ "$ever" == 0 && $elapsed -ge 30 ]]; then write_state STOPPING "$ever" "$started"; state=STOPPING; fi
+  elif [[ "$state" == ACTIVE && "$ever" == 1 ]]; then
+    if [[ "$already_reconciled" != 1 ]]; then reconcile_locked; fi
+    if [[ $live_count -eq 0 && $indeterminate_count -eq 0 ]]; then
+      write_state STOPPING "$ever" "$started"; state=STOPPING
+    fi
+  fi
+}
+
+mark_ready() {
+  local identity
+  identity=$(proc_identity 1) || { echo 'Cannot identify the VPN manager process.' >&2; return 1; }
+  printf '%s\n' "$identity" > "$ready_file.tmp"
+  mv -f "$ready_file.tmp" "$ready_file"
+}
+
+manager_is_ready() {
+  local identity recorded
+  identity=$(proc_identity 1) || return 1
+  [[ -r "$ready_file" ]] || return 1
+  IFS= read -r recorded < "$ready_file" || return 1
+  [[ "$recorded" == "$identity" ]]
+}
+
+initialize_locked() {
+  local generation
+  rm -rf -- "$sessions" "$runtime/registered"
+  mkdir -m 0700 -p "$sessions" "$runtime/registered"
+  generation="$(date +%s)-$$-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '%s\n' "$generation" > "$runtime/generation"
+  chmod 0600 "$runtime/generation"
+  write_state STARTING 0 "$(date +%s)"
+  chmod 0600 "$state_file"
+}
+
+begin_registration_grace_locked() {
+  read_state || return 1
+  [[ "$state" == STARTING && "$ever" == 0 ]] || return 1
+  write_state WAITING_FIRST_SESSION 0 "$(date +%s)"
+}
+
+launch_session() {
+  local id=$1 mode=$2; shift 2
+  [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid session identifier.' >&2; return 2; }
+  local generation identity
+  generation=$(cat "$runtime/generation")
+  identity=$(proc_identity "$$") || { echo 'Cannot inspect session process identity.' >&2; return 1; }
+  locked register "$id" "$$" "$identity" "$generation"
+  touch "$runtime/registered/$id"
+  local acknowledged=0
+  for _ in {1..30}; do
+    if [[ -f "$runtime/registered/$id.ack" ]]; then acknowledged=1; break; fi
+    sleep 1
+  done
+  rm -f "$runtime/registered/$id" "$runtime/registered/$id.ack"
+  [[ "$acknowledged" == 1 ]] || { echo 'Session coordinator did not acknowledge registration.' >&2; return 1; }
+  local -a ssh_args=()
+  [[ ! -f "$HOME/.ssh/config" ]] || ssh_args=(-F "$HOME/.ssh/config")
+  case "$mode" in
+    ssh)
+      if [[ $# -gt 0 ]]; then exec ssh "${ssh_args[@]}" "$@"; fi
+      echo 'VPN is connected. OpenVPN log: /tmp/openvpn.log'
+      exec /usr/local/bin/sd-vpnc-shell
+      ;;
+    ssh-tmux)
+      local host=${1:-} session=${2:-}
+      [[ -n "$host" ]] || { echo 'A host is required for ssh-tmux.' >&2; return 2; }
+      if [[ -n "$session" && ! "$session" =~ ^[[:alnum:]_.-]+$ ]]; then
+        echo 'tmux session names may contain only letters, numbers, ., _, and -.' >&2; return 2
       fi
+      if [[ -n "$session" ]]; then exec ssh "${ssh_args[@]}" "$host" -t "tmux new -s '$session' || tmux attach -t '$session'"; fi
+      exec ssh "${ssh_args[@]}" "$host"
+      ;;
+    *) echo "Unknown session mode: $mode" >&2; return 2 ;;
+  esac
+}
+
+locked_action() {
+  local action=$1; shift
+  [[ -r "$runtime/generation" ]] || return 1
+  generation=$(cat "$runtime/generation")
+  case "$action" in
+    register)
+      local id=$1 pid=$2 identity=$3 wanted_generation=$4
+      read_state || return 1
+      [[ "$wanted_generation" == "$generation" ]] || { echo 'Manager generation changed.' >&2; return 1; }
+      case "$state" in
+        WAITING_FIRST_SESSION)
+          [[ $(( $(date +%s) - started )) -lt 30 ]] || { echo 'Manager first-session grace expired.' >&2; return 1; }
+          ;;
+        ACTIVE) ;;
+        *) echo 'VPN manager is stopping; retry the request.' >&2; return 1 ;;
+      esac
+      printf '%s\n%s\n%s\n' "$pid" "$identity" "$generation" > "$sessions/$id.tmp"
+      chmod 0600 "$sessions/$id.tmp"
+      mv -f "$sessions/$id.tmp" "$sessions/$id"
+      write_state ACTIVE 1 "$started"
+      ;;
+    start-grace)
+      begin_registration_grace_locked
+      ;;
+    acknowledge)
+      local id=$1
+      read_state || return 1
+      [[ "$state" == ACTIVE && -f "$sessions/$id" ]] || { echo 'Session registration is no longer active.' >&2; return 1; }
+      touch "$runtime/registered/$id.ack"
+      ;;
+    status|reconcile|release|stop-if-idle)
+      read_state || return 1
+      if [[ "$action" == release ]]; then
+        local id=$1 file="$sessions/$1" result
+        if [[ -f "$file" ]]; then
+          result=$(classify_lease "$file")
+          # A normal engine-exec return has exited; a catchable host signal does
+          # not prove that the in-container process ended, so retain a live lease.
+          [[ "$result" == stale\ * ]] && rm -f -- "$file"
+        fi
+      fi
+      reconcile_locked
+      if [[ "$action" == stop-if-idle ]]; then
+        if [[ "$state" == WAITING_FIRST_SESSION && $live_count -eq 0 && $indeterminate_count -eq 0 ]]; then
+          write_state STOPPING "$ever" "$started"; state=STOPPING
+        elif [[ "$state" == ACTIVE && $live_count -eq 0 && $indeterminate_count -eq 0 ]]; then
+          write_state STOPPING "$ever" "$started"; state=STOPPING
+        fi
+      else
+        manager_transition_locked 1
+      fi
+      printf 'ownership=sd-vpnc protocol=1 state=%s generation=%s live=%s stale=%s indeterminate=%s' \
+        "$state" "$generation" "$live_count" "$stale_count" "$indeterminate_count"
+      if [[ $indeterminate_count -gt 0 ]]; then printf ' indeterminate_ids=%s' "${indeterminate_ids# }"; fi
+      printf '\n'
+      ;;
+    watch-once)
+      manager_transition_locked
+      printf '%s\n' "$state"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+case ${1:-} in
+  ready) manager_is_ready ;;
+  mark-ready) mark_ready ;;
+  initialize)
+    mkdir -m 0700 -p "$runtime"
+    touch "$lock_file"
+    chmod 0600 "$lock_file"
+    flock -x "$lock_file" "$0" __locked-initialize
+    ;;
+  __locked-initialize) initialize_locked ;;
+  launch) shift; launch_session "$@" ;;
+  status|reconcile|release|stop-if-idle|acknowledge|start-grace)
+    action=$1; shift; locked "$action" "$@"
+    ;;
+  watch)
+    while :; do
+      state=$(locked watch-once) || exit 1
+      [[ "$state" != STOPPING ]] || exit 0
       sleep 1
     done
-    echo "Timed out waiting for SSH tunnel setup." >&2
-    cat "$ssh_log" >&2 || true
-    kill "$ssh_pid" 2>/dev/null || true
-    wait "$ssh_pid" 2>/dev/null || true
-    exit 1
     ;;
-  *)
-    echo "Unknown container command: $mode" >&2
-    exit 2
+  __locked-register) shift; locked_action register "$@" ;;
+  __locked-status|__locked-reconcile|__locked-release|__locked-stop-if-idle|__locked-acknowledge|__locked-start-grace)
+    action=${1#__locked-}; shift; locked_action "$action" "$@"
     ;;
+  __locked-watch-once) locked_action watch-once ;;
+  *) echo "Unknown registry command: ${1:-}" >&2; exit 2 ;;
 esac
-ENTRYPOINT
+REGISTRY
 
 	cat >"$build_dir/home-init.sh" <<'HOME_INIT'
 sd_vpnc_copy_entry() {
@@ -523,6 +768,9 @@ config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/sd-vpnc
 ssh_config=${SD_VPNC_SSH_CONFIG:-"$HOME/.ssh"}
 config=${SD_VPNC_CONFIG:-"$config_dir/client.ovpn"}
 credentials=${SD_VPNC_CREDENTIALS:-"$config_dir/credentials"}
+lifecycle_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/sd-vpnc
+lifecycle_lock=$lifecycle_dir/lifecycle.lock
+manager_manifest=$lifecycle_dir/manager.manifest
 rebuild=0
 
 init_cmd() {
@@ -613,9 +861,449 @@ run_container_engine() {
 	operation=$1
 	shift
 	if [ "$container_command" = podman ] && [ "$podman_rootless" = true ]; then
-		exec "$container_command" "$operation" --userns=keep-id "$@"
+		"$container_command" "$operation" --userns=keep-id "$@"
+	else
+		"$container_command" "$operation" "$@"
 	fi
-	exec "$container_command" "$operation" "$@"
+}
+
+require_flock() {
+	command -v flock >/dev/null 2>&1 || die "The host 'flock' utility is required for safe VPN session lifecycle management. Install util-linux (for example, 'brew install util-linux' on macOS). No container state was changed."
+}
+
+lifecycle_lock() {
+	require_flock
+	(umask 077; mkdir -p "$lifecycle_dir") || die "Cannot create the private sd-vpnc state directory."
+	chmod 700 "$lifecycle_dir" || die "Cannot secure the private sd-vpnc state directory."
+	exec 9>"$lifecycle_lock"
+	chmod 600 "$lifecycle_lock" || die "Cannot secure the sd-vpnc lifecycle lock."
+	flock -x 9 || die "Could not acquire the sd-vpnc lifecycle lock."
+}
+
+lifecycle_unlock() {
+	flock -u 9 2>/dev/null || true
+}
+
+canonical_path() {
+	path=$1
+	case $path in
+		/*) ;;
+		*) path=$PWD/$path ;;
+	esac
+	if [ -d "$path" ]; then
+		(CDPATH='' cd -P "$path" 2>/dev/null && pwd -P)
+	else
+		path_dir=${path%/*}
+		path_base=${path##*/}
+		[ -n "$path_dir" ] || path_dir=/
+		canonical_dir=$(CDPATH='' cd -P "$path_dir" 2>/dev/null && pwd -P) || return 1
+		printf '%s/%s\n' "${canonical_dir%/}" "$path_base"
+	fi
+}
+
+emit_manager_manifest() {
+	printf '%s\n' \
+		"protocol=1" \
+		"engine=$container_command" \
+		"engine-context=$manager_engine_context" \
+		"container-host=${CONTAINER_HOST:-}" \
+		"docker-host=${DOCKER_HOST:-}" \
+		"docker-context=${DOCKER_CONTEXT:-}" \
+		"podman-connection=${CONTAINER_CONNECTION:-}" \
+		"user=$(id -u):$(id -g)" \
+		"image=$IMAGE" \
+		"workdir=$(canonical_path "$workdir")" \
+		"config-mount=$(canonical_path "$config_dir")" \
+		"vpn-config=$(canonical_path "$config")" \
+		"credentials=$(canonical_path "$credentials")" \
+		"ssh-source=$(canonical_path "$ssh_config")" \
+		"rootless=$podman_rootless" \
+		"workspace-set=${DEVPOD_WORKSPACE_ID+x}" \
+		"workspace=${DEVPOD_WORKSPACE_ID:-}"
+}
+
+manifest_matches() {
+	candidate=$lifecycle_dir/manifest-check.$$
+	(umask 077; emit_manager_manifest > "$candidate") || return 1
+	chmod 600 "$candidate" || { rm -f "$candidate"; return 1; }
+	cmp -s "$manager_manifest" "$candidate"
+	result=$?
+	rm -f "$candidate"
+	return "$result"
+}
+
+save_manager_manifest() {
+	candidate=$lifecycle_dir/manager-manifest.$$
+	(umask 077; emit_manager_manifest > "$candidate") || die "Cannot record VPN manager startup options."
+	chmod 600 "$candidate" && mv -f "$candidate" "$manager_manifest" || die "Cannot secure VPN manager startup options."
+}
+
+manager_verify_owned() {
+	labels=$($container_command container inspect --format '{{ index .Config.Labels "io.sd-vpnc.manager" }}|{{ index .Config.Labels "io.sd-vpnc.protocol" }}' "$CONTAINER_NAME" 2>/dev/null) || return 1
+	[ "$labels" = 'sd-vpnc|1' ]
+}
+
+manager_exists_owned() {
+	if ! container_exists_named "$CONTAINER_NAME"; then
+		"$container_command" info >/dev/null 2>&1 || die "Cannot verify whether the VPN manager exists; leaving its state untouched."
+		return 1
+	fi
+	manager_verify_owned || die "Container '$CONTAINER_NAME' is not a verified sd-vpnc manager; leaving it untouched."
+	return 0
+}
+
+manager_is_running() {
+	if ! manager_verify_owned; then
+		if ! container_exists_named "$CONTAINER_NAME"; then
+			"$container_command" info >/dev/null 2>&1 || die "Cannot verify whether the VPN manager exists; leaving its state untouched."
+			return 1
+		fi
+		die "VPN manager ownership could not be verified; leaving it untouched."
+	fi
+	if ! manager_running_state=$("$container_command" container inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null); then
+		if ! container_exists_named "$CONTAINER_NAME"; then
+			"$container_command" info >/dev/null 2>&1 || die "Cannot verify whether the VPN manager exists; leaving its state untouched."
+			return 1
+		fi
+		die "Could not inspect the VPN manager; leaving it untouched."
+	fi
+	case $manager_running_state in
+		true) return 0 ;;
+		false) return 1 ;;
+		*) die "VPN manager state inspection returned an invalid result; leaving it untouched." ;;
+	esac
+}
+
+manager_is_ready() {
+	manager_verify_owned || return 1
+	"$container_command" exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-entrypoint ready >/dev/null 2>&1
+}
+
+wait_manager_ready() {
+	waited=0
+	while [ "$waited" -lt 120 ]; do
+		manager_is_ready && return 0
+		manager_exists_owned || return 1
+		manager_is_running || return 1
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+manager_status() {
+	manager_verify_owned || return 1
+	"$container_command" exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-entrypoint status
+}
+
+status_field() {
+	printf '%s\n' "$1" | sed -n "s/.* $2=\([^ ]*\).*/\\1/p"
+}
+
+wait_manager_removed() {
+	waited=0
+	while [ "$waited" -lt 10 ]; do
+		if ! manager_exists_owned; then
+			rm -f "$manager_manifest"
+			return 0
+		fi
+		if ! manager_is_running; then
+			if manager_exists_owned; then
+				"$container_command" container rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+			fi
+			rm -f "$manager_manifest"
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	# Only a locked registry transition to STOPPING permits this verified stop.
+	stop_state=$($container_command exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-entrypoint status 2>/dev/null || true)
+	case $stop_state in *'state=STOPPING'*) ;; *) return 1 ;; esac
+	manager_verify_owned || return 1
+	"$container_command" container stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+	waited=0
+	while [ "$waited" -lt 10 ]; do
+		if ! manager_exists_owned; then rm -f "$manager_manifest"; return 0; fi
+		if ! manager_is_running; then
+			if manager_exists_owned; then
+				"$container_command" container rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+			fi
+			rm -f "$manager_manifest"
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+manager_stop_if_idle() {
+	if ! stop_report=$(manager_status); then
+		if ! manager_exists_owned; then rm -f "$manager_manifest"; return 0; fi
+		die "Could not reconcile VPN sessions; leaving the manager running."
+	fi
+	live=$(status_field "$stop_report" live)
+	indeterminate=$(status_field "$stop_report" indeterminate)
+	[ -n "$live" ] && [ -n "$indeterminate" ] || die "Could not read VPN session status; leaving the manager running."
+	if [ "$live" -ne 0 ] || [ "$indeterminate" -ne 0 ]; then
+		return 1
+	fi
+	if ! stop_report=$("$container_command" exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-session-registry stop-if-idle); then
+		if ! manager_exists_owned; then rm -f "$manager_manifest"; return 0; fi
+		die "Could not mark the idle VPN manager as stopping."
+	fi
+	indeterminate=$(status_field "$stop_report" indeterminate)
+	live=$(status_field "$stop_report" live)
+	[ "${live:-1}" -eq 0 ] && [ "${indeterminate:-1}" -eq 0 ] || return 1
+	wait_manager_removed || die "VPN manager did not stop after its session registry entered STOPPING."
+	return 0
+}
+
+prepare_manager_runtime() {
+	uid=$(id -u)
+	gid=$(id -g)
+	home_tmpfs_args "$uid" "$gid"
+	devpod_workspace_env_args
+	configure_runtime_mounts
+	if [ "$container_command" = podman ]; then
+		manager_engine_context=${CONTAINER_CONNECTION:-}
+		if [ -z "$manager_engine_context" ]; then
+			manager_engine_context=$(podman info --format '{{.Host.RemoteSocket.Path}}') || die "Failed to determine the active Podman connection."
+		fi
+	else
+		manager_engine_context=${DOCKER_CONTEXT:-}
+		if [ -z "$manager_engine_context" ]; then
+			manager_engine_context=$(docker context show) || die "Failed to determine the active Docker context."
+		fi
+	fi
+	manager_relabel=
+	if [ "$container_command" = podman ] && [ "$podman_rootless" = true ]; then manager_relabel=,z; fi
+	config_source=$(canonical_path "$config") || die "Cannot resolve the VPN configuration source path."
+	config_file_mount="$config_source:/config/client.ovpn:ro$manager_relabel"
+	credentials_mount=
+	if [ -f "$credentials" ]; then
+		credentials_source=$(canonical_path "$credentials") || die "Cannot resolve the VPN credentials source path."
+		credentials_mount="$credentials_source:/config/credentials:ro$manager_relabel"
+	fi
+}
+
+start_manager() {
+	if [ "$rebuild" = 1 ] || ! "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then build_image; fi
+	set -- run --detach --rm \
+		--name "$CONTAINER_NAME" \
+		--label io.sd-vpnc.manager=sd-vpnc \
+		--label io.sd-vpnc.protocol=1 \
+		--cap-add=NET_ADMIN --device /dev/net/tun \
+		--user "$uid:$gid" \
+		"$home_tmpfs_flag" "$home_tmpfs_value" \
+		--workdir /home/dev \
+		-e HOME=/home/dev \
+		${devpod_env_arg:+-e} ${devpod_env_arg:+"$devpod_env_arg"} \
+		-v "$config_mount" -v "$config_file_mount" \
+		-v "$ssh_mount" -v "$work_mount"
+	if [ -n "$credentials_mount" ]; then set -- "$@" -v "$credentials_mount"; fi
+	set -- "$@" "$IMAGE" manager
+	container_id=$(run_container_engine "$@") || die "Failed to start the VPN manager container."
+	printf 'Starting VPN manager %s.\n' "$CONTAINER_NAME"
+	waited=0
+	while [ "$waited" -lt 120 ]; do
+		if ! manager_exists_owned; then
+			"$container_command" logs "$CONTAINER_NAME" >&2 2>/dev/null || true
+			manager_verify_owned && "$container_command" container rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+			die "VPN manager exited before becoming ready."
+		fi
+		if manager_is_ready; then
+			save_manager_manifest
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	manager_verify_owned && "$container_command" container stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+	manager_verify_owned && "$container_command" container rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+	die "Timed out waiting for VPN manager readiness."
+}
+
+session_id() {
+	printf '%s-%s-%s-%s\n' "$(id -u)" "$$" "$(date +%s)" "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+launch_managed_exec() {
+	mode=$1
+	shift
+	managed_session_id=$(session_id)
+	"$container_command" exec -it --workdir /work "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-entrypoint session \
+		"$managed_session_id" "$mode" "$@" 9>&- <&0 &
+	managed_exec_pid=$!
+	registered=0
+	waited=0
+	while [ "$waited" -lt 35 ]; do
+		if "$container_command" exec "$CONTAINER_NAME" test -f "/tmp/sd-vpnc-session-registry/registered/$managed_session_id" >/dev/null 2>&1; then
+			if "$container_command" exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-session-registry acknowledge "$managed_session_id" >/dev/null 2>&1; then
+				registered=1
+			fi
+			break
+		fi
+		if ! kill -0 "$managed_exec_pid" 2>/dev/null; then break; fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	if [ "$registered" != 1 ]; then
+		if kill -0 "$managed_exec_pid" 2>/dev/null; then
+			kill -TERM "$managed_exec_pid" 2>/dev/null || true
+		fi
+		wait "$managed_exec_pid" 2>/dev/null || true
+		managed_exec_pid=
+		return 1
+	fi
+	return 0
+}
+
+manager_removed_after_rejected_registration() {
+	if ! manager_exists_owned; then
+		rm -f "$manager_manifest"
+		return 0
+	fi
+	if ! manager_is_running; then
+		wait_manager_removed
+		return $?
+	fi
+	if ! manager_status_report=$(manager_status 2>/dev/null); then
+		if ! manager_exists_owned; then
+			rm -f "$manager_manifest"
+			return 0
+		fi
+		if ! manager_is_running; then
+			wait_manager_removed
+			return $?
+		fi
+		return 1
+	fi
+	[ "$(status_field "$manager_status_report" state)" = STOPPING ] || return 1
+	wait_manager_removed
+}
+
+finish_managed_session() {
+	finished_id=$1
+	lifecycle_lock
+	if manager_exists_owned; then
+		release_report=$("$container_command" exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-session-registry release "$finished_id" 2>/dev/null) || release_report=
+		if [ -z "$release_report" ]; then
+			if ! manager_exists_owned; then
+				rm -f "$manager_manifest"
+			else
+				printf 'Could not reconcile session %s; VPN manager is being left untouched.\n' "$finished_id" >&2
+			fi
+		else
+			live=$(status_field "$release_report" live)
+			indeterminate=$(status_field "$release_report" indeterminate)
+			state=$(status_field "$release_report" state)
+			if [ "${live:-1}" -eq 0 ] && [ "${indeterminate:-1}" -eq 0 ] && [ "$state" = STOPPING ]; then
+				wait_manager_removed || printf 'VPN manager remains in STOPPING; run status to inspect it.\n' >&2
+			fi
+		fi
+	else
+		rm -f "$manager_manifest"
+	fi
+	lifecycle_unlock
+}
+
+handle_session_signal() {
+	session_signal_status=$1
+	[ -z "${managed_exec_pid:-}" ] || kill -TERM "$managed_exec_pid" 2>/dev/null || true
+	[ -z "${managed_exec_pid:-}" ] || wait "$managed_exec_pid" 2>/dev/null || true
+	finish_managed_session "$managed_session_id"
+	exit "$session_signal_status"
+}
+
+run_managed_session() {
+	mode=$1; shift
+	detect_container || die "Neither podman nor docker is installed."
+	require_flock
+	need_dir "$workdir"
+	need_dir "$ssh_config"
+	[ -f "$config" ] || die "VPN configuration file not found: $config (run '$PROGRAM init')"
+	if [ -e "$credentials" ] && [ ! -f "$credentials" ]; then die "VPN credentials path is not a regular file: $credentials"; fi
+	prepare_manager_runtime
+	lifecycle_lock
+	if manager_exists_owned; then
+		if ! manager_is_running; then
+			if manager_exists_owned; then
+				"$container_command" container rm "$CONTAINER_NAME" >/dev/null 2>&1 || die "Could not remove the stopped owned VPN manager."
+			fi
+			rm -f "$manager_manifest"
+		elif wait_manager_ready && manager_report=$(manager_status); then
+			manager_live=$(status_field "$manager_report" live)
+			manager_indeterminate=$(status_field "$manager_report" indeterminate)
+			manager_state=$(status_field "$manager_report" state)
+			[ -n "$manager_live" ] && [ -n "$manager_indeterminate" ] || die "Could not read VPN session status; leaving the manager running."
+			if [ "$rebuild" = 1 ] && { [ "$manager_live" -gt 0 ] || [ "$manager_indeterminate" -gt 0 ]; }; then
+				die "Cannot rebuild the VPN image while managed sessions are live or indeterminate."
+			fi
+			if [ "$manager_state" = STOPPING ] || { [ "$manager_live" -eq 0 ] && [ "$manager_indeterminate" -eq 0 ] && [ "$manager_state" = ACTIVE ]; }; then
+				manager_stop_if_idle || die "VPN manager has live or indeterminate sessions; leaving it running."
+			elif [ -f "$manager_manifest" ] && ! manifest_matches; then
+				if [ "$manager_live" -gt 0 ] || [ "$manager_indeterminate" -gt 0 ]; then
+					die "The running VPN manager uses different startup options; end its sessions before changing options."
+				fi
+				manager_stop_if_idle || die "VPN manager could not be safely stopped."
+			elif [ ! -f "$manager_manifest" ]; then
+				if [ "$manager_live" -gt 0 ] || [ "$manager_indeterminate" -gt 0 ]; then
+					die "The running VPN manager has no verifiable startup manifest; leaving it untouched."
+				fi
+				manager_stop_if_idle || die "VPN manager could not be safely stopped."
+			fi
+		else
+			if manager_exists_owned; then
+				die "Could not communicate with the VPN manager; leaving it untouched."
+			fi
+			rm -f "$manager_manifest"
+		fi
+	else
+		rm -f "$manager_manifest"
+	fi
+	if ! manager_exists_owned; then
+		start_manager
+		rebuild=0
+	elif [ "$rebuild" = 1 ]; then
+		manager_stop_if_idle || die "VPN manager could not be safely stopped before rebuild."
+		start_manager
+		rebuild=0
+	fi
+	registered=0
+	registration_attempt=0
+	while [ "$registration_attempt" -lt 2 ]; do
+		if launch_managed_exec "$mode" "$@"; then
+			registered=1
+			break
+		fi
+		if [ "$registration_attempt" -ne 0 ] || ! manager_removed_after_rejected_registration; then
+			break
+		fi
+		start_manager
+		rebuild=0
+		registration_attempt=$((registration_attempt + 1))
+	done
+	if [ "$registered" != 1 ]; then
+		if manager_exists_owned; then
+			"$container_command" exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-session-registry stop-if-idle >/dev/null 2>&1 || true
+			manager_status_report=$($container_command exec "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-entrypoint status 2>/dev/null || true)
+			manager_state=$(status_field "$manager_status_report" state)
+			[ "$manager_state" = STOPPING ] && wait_manager_removed || true
+		fi
+		lifecycle_unlock
+		die "The VPN session did not register before startup grace expired."
+	fi
+	lifecycle_unlock
+	trap 'handle_session_signal 129' HUP
+	trap 'handle_session_signal 130' INT
+	trap 'handle_session_signal 143' TERM
+	session_status=0
+	wait "$managed_exec_pid" || session_status=$?
+	trap - HUP INT TERM
+	finish_managed_session "$managed_session_id"
+	return "$session_status"
 }
 
 status_item() {
@@ -670,6 +1358,37 @@ stop_tun() {
 	printf 'Stopped tunnel %s.\n' "$TUN_CONTAINER_NAME"
 }
 
+prepare_image_rebuild() {
+	detect_container || die "Neither podman nor docker is installed."
+	require_flock
+	lifecycle_lock
+	if manager_exists_owned; then
+		if manager_is_running; then
+			rebuild_report=$(manager_status) || die "Could not reconcile VPN sessions; leaving the manager running."
+			rebuild_live=$(status_field "$rebuild_report" live)
+			rebuild_indeterminate=$(status_field "$rebuild_report" indeterminate)
+			[ -n "$rebuild_live" ] && [ -n "$rebuild_indeterminate" ] || die "Could not read VPN session status; leaving the manager running."
+			if [ "$rebuild_live" -gt 0 ] || [ "$rebuild_indeterminate" -gt 0 ]; then
+				die "Cannot rebuild the VPN image while managed sessions are live or indeterminate."
+			fi
+			manager_stop_if_idle || die "VPN manager could not be safely stopped before rebuilding."
+		else
+			if manager_exists_owned; then
+				"$container_command" container rm "$CONTAINER_NAME" >/dev/null 2>&1 || die "Could not remove the stopped owned VPN manager."
+			fi
+			rm -f "$manager_manifest"
+		fi
+	else
+		rm -f "$manager_manifest"
+	fi
+}
+
+rebuild_image_transaction() {
+	prepare_image_rebuild
+	build_image
+	lifecycle_unlock
+}
+
 status_cmd() {
 	banner
 	printf '%s %s\n\n' "$(style "$BOLD" sd-vpnc)" "$(style "$DIM" "v$VERSION")"
@@ -713,8 +1432,38 @@ status_cmd() {
 
 	if container_is_running; then
 		status_item ok vpn-container "$CONTAINER_NAME (running)"
+		if manager_verify_owned; then
+			if command -v flock >/dev/null 2>&1; then
+				lifecycle_lock
+				if manager_is_ready; then
+					if manager_report=$(manager_status 2>/dev/null); then
+						manager_live=$(status_field "$manager_report" live)
+						manager_stale=$(status_field "$manager_report" stale)
+						manager_indeterminate=$(status_field "$manager_report" indeterminate)
+						manager_state=$(status_field "$manager_report" state)
+						status_item ok vpn-manager "owned (state=${manager_state:-unknown}; live=${manager_live:-?}, stale=${manager_stale:-?}, indeterminate=${manager_indeterminate:-?})"
+						manager_ids=$(status_field "$manager_report" indeterminate_ids)
+						[ -z "$manager_ids" ] || printf '    Indeterminate session IDs:%s\n' "$manager_ids"
+					else
+						status_item optional vpn-manager 'owned, but session status is unavailable; manager left running'
+					fi
+				else
+					status_item optional vpn-manager 'owned but starting/restarting; no session reconciliation attempted'
+				fi
+				lifecycle_unlock
+			else
+				status_item optional vpn-manager 'owned; install host flock to inspect managed sessions'
+			fi
+		else
+			status_item optional vpn-manager 'unrecognized ownership; container left untouched'
+		fi
 	else
 		status_item optional vpn-container "$CONTAINER_NAME (not running)"
+		if container_exists_named "$CONTAINER_NAME"; then
+			if manager_verify_owned; then status_item optional vpn-manager 'owned but stopped'; else status_item optional vpn-manager 'unrecognized ownership; container left untouched'; fi
+		else
+			status_item optional vpn-manager 'not running'
+		fi
 	fi
 
 	if container_is_running_named "$TUN_CONTAINER_NAME"; then
@@ -725,54 +1474,16 @@ status_cmd() {
 }
 
 shell_cmd() {
-	detect_container || die "Neither podman nor docker is installed."
-	if container_is_running_named "$TUN_CONTAINER_NAME"; then
+	if detect_container && container_is_running_named "$TUN_CONTAINER_NAME"; then
 		exec "$container_command" exec -it "$TUN_CONTAINER_NAME" /usr/local/bin/sd-vpnc-shell
 	fi
-	container_is_running || die "No running VPN container. Start one with '$PROGRAM ssh', '$PROGRAM ssh <host>', or '$PROGRAM tun <host> <mapping>'."
-	exec "$container_command" exec -it "$CONTAINER_NAME" /usr/local/bin/sd-vpnc-shell
+	run_managed_session ssh
 }
 
 run_container() {
 	mode=$1
 	shift
-	detect_container || die "Neither podman nor docker is installed."
-	need_dir "$workdir"
-	need_dir "$ssh_config"
-	[ -f "$config" ] || die "VPN configuration file not found: $config (run '$PROGRAM init')"
-	if [ -e "$credentials" ] && [ ! -f "$credentials" ]; then
-		die "VPN credentials path is not a regular file: $credentials"
-	fi
-
-	if container_is_running; then
-		die "VPN container '$CONTAINER_NAME' is already running; use '$PROGRAM shell' to enter it."
-	fi
-	if "$container_command" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-		"$container_command" container rm "$CONTAINER_NAME" >/dev/null
-	fi
-
-	if [ "$rebuild" = 1 ] || ! "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then
-		build_image
-	fi
-
-	uid=$(id -u)
-	gid=$(id -g)
-	home_tmpfs_args "$uid" "$gid"
-	devpod_workspace_env_args
-	configure_runtime_mounts
-	run_container_engine run --rm -it \
-		--name "$CONTAINER_NAME" \
-		--cap-add=NET_ADMIN \
-		--device /dev/net/tun \
-		--user "$uid:$gid" \
-		"$home_tmpfs_flag" "$home_tmpfs_value" \
-		--workdir /home/dev \
-		-e HOME=/home/dev \
-		${devpod_env_arg:+-e} ${devpod_env_arg:+"$devpod_env_arg"} \
-		-v "$config_mount" \
-		-v "$ssh_mount" \
-		-v "$work_mount" \
-		"$IMAGE" "$mode" "$@"
+	run_managed_session "$mode" "$@"
 }
 
 start_tun() {
@@ -826,7 +1537,10 @@ start_tun() {
 	if container_exists_named "$TUN_CONTAINER_NAME"; then
 		"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null
 	fi
-	if [ "$rebuild" = 1 ] || ! "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then
+	if [ "$rebuild" = 1 ]; then
+		rebuild_image_transaction
+		rebuild=0
+	elif ! "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then
 		build_image
 	fi
 
@@ -933,9 +1647,16 @@ Use normal OpenSSH argument ordering: SSH options before the host, then an optio
 Bare 'ssh' (no destination or SSH arguments) starts a local interactive shell inside the VPN container. 'ssh HOST' invokes remote SSH and opens the remote default shell when no remote command is supplied.
 For host-accessible forwards, use 'tun' rather than 'ssh -L': tunnel ports are published
 on 127.0.0.1 of the host. Detached tunnels require SSH authentication without prompts.
-Use 'tun --stop' to close it. A regular SSH container is removed when its session exits.
-Use 'shell' in another terminal to enter an active container. Starting a new 'shell' when
-none is active creates a fresh VPN container and interactive shell.
+Use 'tun --stop' to close it. Regular shell, SSH, and SSH-tmux sessions share one
+persistent manager and execute separately; the manager stops after the final lease.
+Use 'shell' in another terminal to attach or start a local shell. The existing
+separate tunnel container remains the preferred 'shell' target when it is running.
+The first manager fixes engine/context, user, image, VPN/config/credentials and SSH
+source paths, workdir, rootless mode, and workspace ID; later mismatches are rejected.
+A 30-second first-session grace cleans up failed starts. Status reconciles only
+provably stale process-identity leases and preserves uncertain sessions. \`--rebuild\`
+is rejected while sessions are live/indeterminate and stops an idle owned manager.
+Host util-linux \`flock\` is required; without it lifecycle commands fail closed.
 
 Global options precede the command:
   $PROGRAM -C DIRECTORY ssh HOST  Mount DIRECTORY at /work inside the container.
@@ -945,15 +1666,21 @@ Image management:
   $PROGRAM image                 Build the local image (no registry publish required).
   $PROGRAM image --rebuild       Rebuild the local image.
 
-Requirements: Podman or Docker, /dev/net/tun, NET_ADMIN capability, and a valid VPN config.
+Requirements: Podman or Docker, host \`flock\` (util-linux), /dev/net/tun,
+NET_ADMIN capability, and a valid VPN config.
 Do not start a connection or change user configuration unless asked.
 EOF
 		;;
 	image)
 		detect_container || die "Neither podman nor docker is installed."
-		[ "${1:-}" = --rebuild ] && shift
+		image_rebuild=$rebuild
+		[ "${1:-}" = --rebuild ] && image_rebuild=1 && shift
 		[ "$#" -eq 0 ] || die "Usage: $PROGRAM image [--rebuild]"
-		build_image
+		if [ "$image_rebuild" = 1 ]; then
+			rebuild_image_transaction
+		else
+			build_image
+		fi
 		;;
 	ssh)
 		run_container ssh "$@"
@@ -981,11 +1708,11 @@ EOF
 		;;
 	shell|cli)
 		[ "$#" -eq 0 ] || die "Usage: $PROGRAM shell"
-		if container_is_running; then
+		if container_is_running || { detect_container && container_is_running_named "$TUN_CONTAINER_NAME"; }; then
 			shell_cmd
 		else
-			# Start a fresh VPN container with an interactive shell when there
-			# is no connection container to enter.
+			# Start a fresh VPN manager with an interactive shell when there
+			# is no running container target to enter.
 			run_container ssh
 		fi
 		;;

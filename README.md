@@ -210,18 +210,48 @@ complete without prompts. Pre-accept the host key (e.g. by connecting with
 `sd-vpnc ssh HOST`) and use a key that requires no passphrase prompt;
 password/passphrase prompts are not supported by this command.
 
-A connection command keeps its named container alive until that SSH/shell
-session exits. While it is running, open another terminal and run:
+Regular `ssh`, `ssh-tmux`, and `shell` sessions share one detached VPN manager.
+The first request starts the manager, which starts OpenVPN once and remains
+alive independently of client commands. Each request uses its own engine `exec`
+session; closing one shell/SSH/tmux session does not interrupt another. The
+manager stops and is auto-removed after the final session ends. A container-side
+watcher performs the same cleanup if the host command disappears.
+
+The first manager selects the effective engine/context, numeric user, image,
+VPN/config/credentials and SSH source paths, work directory, rootless mount
+mode, and `DEVPOD_WORKSPACE_ID`. Later requests must use matching options;
+`sd-vpnc` rejects mismatches without printing the stored values. End all sessions
+before changing those options. `--rebuild` is rejected while any live or
+indeterminate managed session exists; an idle owned manager is stopped before
+rebuilding/restarting. `sd-vpnc image --rebuild` follows the same active-session
+safety check and stops an idle owned manager before rebuilding.
+
+On startup the manager allows up to 30 seconds for its first session to
+register. Session leases record the manager generation and the in-container
+process PID/start identity. `status` reconciles only provably stale leases and
+reports live, stale, and indeterminate counts (including IDs for uncertain
+leases). Host-client death alone is not evidence that a session ended. If
+process/engine inspection is uncertain, the lease and manager are preserved;
+this can leave a manager running until the uncertainty is resolved.
+
+Lifecycle start/attach/last-session transitions require the host `flock`
+utility (provided by util-linux). The command checks for it before changing
+container state and fails closed with installation guidance if it is missing;
+there is no racy shell-lock fallback. Private lifecycle metadata is stored in
+`$XDG_STATE_HOME/sd-vpnc` or `~/.local/state/sd-vpnc`.
+
+Open another terminal and run:
 
 ```bash
 sd-vpnc shell
 # `sd-vpnc cli` is an alias
 ```
 
-This opens an additional shell in the existing VPN-connected container. If no
-container is active, `shell` starts a VPN container and opens its interactive
-shell. The active container is shown in `sd-vpnc status`; it stops when the
-connection shell or SSH session exits.
+This opens an additional local shell in the shared regular manager, or starts a
+manager and shell if none exists. The exception is the existing separate tunnel
+container: while it is running, `shell` continues to prefer that container.
+Tunnel lifecycle and shell-target unification are unchanged and are separate
+from the regular shared-session manager.
 
 `sd-vpnc shell` and bare `sd-vpnc ssh` (without a destination or SSH arguments)
 start login Zsh when Zsh is available, and otherwise start interactive login
@@ -232,8 +262,8 @@ installer may add it. Shell history is written under
 remote command is supplied; it does not select a local Zsh/Bash session.
 
 When the host environment has a non-empty `DEVPOD_WORKSPACE_ID`, `sd-vpnc`
-forwards its value to the runtime container, for both regular containers and the
-detached `sd-vpnc tun` container, so tools such as Starship can display it. If it
+forwards its value to the regular VPN manager and detached `sd-vpnc tun`
+container, so tools such as Starship can display it. If it
 is unset or empty, nothing is forwarded and launch is unchanged. No other host
 environment variable is forwarded.
 
@@ -246,6 +276,7 @@ change the current directory of its parent shell.
 - Podman or Docker
 - `/dev/net/tun` on the host
 - Permission to run containers with `NET_ADMIN`
+- The host `flock` utility (util-linux) for serialized manager lifecycle changes
 - An OpenVPN provider configuration
 
 The runtime process uses the invoking host UID:GID, and runtime files in `/work`
