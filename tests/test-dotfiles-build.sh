@@ -105,8 +105,12 @@ run_sd() {
 cat >"$TMP_ROOT/podman" <<'PODMAN'
 #!/bin/sh
 set -eu
-[ "${1:-}" = build ] || exit 90
-shift
+case ${1:-} in
+	container) exit 1 ;;
+	info) printf 'false\n'; exit 0 ;;
+	build) shift ;;
+	*) exit 90 ;;
+esac
 build_file=
 while [ "$#" -gt 0 ]; do
 	case $1 in
@@ -130,8 +134,9 @@ cp "$build_context/Containerfile" "$CONTAINERFILE_CAPTURE"
 mkdir -p "$CAPTURE_DIR"
 cp "$build_context/home-init.sh" "$CAPTURE_DIR/home-init.sh"
 cp "$build_context/sd-vpnc-shell" "$CAPTURE_DIR/sd-vpnc-shell"
+cp "$build_context/sd-vpnc-session-registry" "$CAPTURE_DIR/sd-vpnc-session-registry"
 cp "$build_context/entrypoint.sh" "$CAPTURE_DIR/entrypoint.sh"
-for generated_script in home-init.sh sd-vpnc-shell entrypoint.sh; do
+for generated_script in home-init.sh sd-vpnc-shell sd-vpnc-session-registry entrypoint.sh; do
 	/bin/bash -n "$CAPTURE_DIR/$generated_script" || exit 99
 done
 if [ "${EXPECT_DOTFILES:-no}" = yes ]; then
@@ -263,7 +268,7 @@ make_fake_path() {
 make_path_without_git() {
 	RESTRICTED_BIN="$CASE_DIR/no-git-bin"
 	mkdir -p "$RESTRICTED_BIN"
-	for utility in cat cp id mkdir mktemp rm; do
+	for utility in cat chmod cp flock id mkdir mktemp rm; do
 		utility_path=$(command -v "$utility") || fail "missing utility: $utility"
 		ln -s "$utility_path" "$RESTRICTED_BIN/$utility"
 	done
@@ -371,6 +376,10 @@ template_line=$(grep -nF 'RUN mkdir -p /usr/share/sd-vpnc/home-template' "$CONTA
 [ "$template_line" -gt "$cleanup_line" ] || fail "runtime home template was copied before Git metadata cleanup"
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY home-init.sh /usr/local/lib/sd-vpnc-home-init.sh'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY sd-vpnc-shell /usr/local/bin/sd-vpnc-shell'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'COPY sd-vpnc-session-registry /usr/local/bin/sd-vpnc-session-registry'
+assert_file_contains "$CONTAINERFILE_CAPTURE" 'util-linux'
+assert_file_contains "$CAPTURE_DIR/entrypoint.sh" 'sd-vpnc-session-registry launch'
+assert_file_contains "$CAPTURE_DIR/entrypoint.sh" 'sd-vpnc-session-registry watch'
 BASE_PACKAGES=$(sed -n '/^RUN dnf -y install/,/dnf clean all/p' "$CONTAINERFILE_CAPTURE")
 assert_not_contains "$BASE_PACKAGES" 'zsh'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'XDG_STATE_HOME=/home/dev/.local/state'
@@ -378,6 +387,17 @@ assert_file_contains "$CONTAINERFILE_CAPTURE" 'ATUIN_HOME=/home/dev/.atuin'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /work'
 assert_file_contains "$CAPTURE_DIR/entrypoint.sh" 'sd_vpnc_seed_home /usr/share/sd-vpnc/home-template'
 assert_file_contains "$CAPTURE_DIR/entrypoint.sh" '/usr/local/bin/sd-vpnc-shell'
+assert_file_contains "$CAPTURE_DIR/entrypoint.sh" 'openvpn --config "$vpn_config"'
+assert_file_contains "$CAPTURE_DIR/sd-vpnc-session-registry" 'proc_identity()'
+assert_file_contains "$CAPTURE_DIR/sd-vpnc-session-registry" 'elapsed -ge 30'
+assert_file_contains "$CAPTURE_DIR/sd-vpnc-session-registry" 'acknowledge)'
+entry_session_line=$(grep -nF 'exec /usr/local/bin/sd-vpnc-session-registry launch' "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
+entry_initialize_line=$(grep -nF '/usr/local/bin/sd-vpnc-session-registry initialize' "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
+entry_openvpn_line=$(grep -nF 'openvpn --config' "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
+entry_ready_line=$(grep -nF '/usr/local/bin/sd-vpnc-session-registry mark-ready' "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
+[ "$entry_session_line" -lt "$entry_openvpn_line" ] || fail "engine exec session path appears after OpenVPN startup"
+[ "$entry_initialize_line" -lt "$entry_openvpn_line" ] || fail "manager registry is not made fresh before VPN startup"
+[ "$entry_openvpn_line" -lt "$entry_ready_line" ] || fail "manager readiness is reported before OpenVPN startup"
 assert_file_contains "$CAPTURE_DIR/entrypoint.sh" "ssh \"\${ssh_args[@]}\" \"\$@\""
 ssh_forward_line=$(grep -nF "ssh \"\${ssh_args[@]}\" \"\$@\"" "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
 local_shell_line=$(grep -nF '/usr/local/bin/sd-vpnc-shell' "$CAPTURE_DIR/entrypoint.sh" | cut -d: -f1)
@@ -778,7 +798,7 @@ fi
 prepare_case docker-engine
 DOCKER_BIN="$CASE_DIR/docker-bin"
 mkdir -p "$DOCKER_BIN"
-for utility in cat chmod cp id mkdir mktemp rm mv sed grep; do
+for utility in cat chmod cp flock id mkdir mktemp rm mv sed grep; do
 	utility_path=$(command -v "$utility") || fail "missing utility: $utility"
 	ln -s "$utility_path" "$DOCKER_BIN/$utility"
 done
@@ -948,6 +968,7 @@ printf '%s' "${0##*/}" >> "$RUNTIME_LOG"
 for argument do printf '[%s]' "$argument" >> "$RUNTIME_LOG"; done
 printf '\n' >> "$RUNTIME_LOG"
 case ${1:-} in
+	context) printf 'default\n'; exit 0 ;;
 	info)
 		case ${FAKE_ROOTLESS_STATUS:-false} in
 			error) exit 77 ;;
@@ -957,14 +978,17 @@ case ${1:-} in
 	container)
 		case ${2:-} in
 			inspect)
-				if [ -f "$RUNTIME_STATE" ]; then
-					[ "${3:-}" != --format ] || printf 'true\n'
-					exit 0
+				[ -f "$RUNTIME_STATE" ] || { [ "${3:-}" = --format ] && printf 'false\n'; exit 1; }
+				if [ "${3:-}" = --format ]; then
+					case ${4:-} in
+						*State.Running*) printf 'true\n' ;;
+						*io.sd-vpnc.manager*) printf 'sd-vpnc|1\n' ;;
+						*) printf 'true\n' ;;
+					esac
 				fi
-				if [ "${3:-}" = --format ]; then printf 'false\n'; exit 0; fi
-				exit 1
+				exit 0
 				;;
-			rm) rm -f "$RUNTIME_STATE"; exit 0 ;;
+			rm|stop) rm -f "$RUNTIME_STATE"; exit 0 ;;
 		esac
 		;;
 	image) exit 0 ;;
@@ -972,7 +996,49 @@ case ${1:-} in
 		case " $* " in *' --detach '*) : > "$RUNTIME_STATE"; printf 'fake-container-id\n' ;; esac
 		exit 0
 		;;
-	exec|logs) exit 0 ;;
+	exec)
+		shift
+		while :; do
+			case ${1:-} in
+				-i|-t|-it) shift ;;
+				--workdir|-w|--user) shift 2 ;;
+				*) break ;;
+			esac
+		done
+		name=${1:-}; shift || true
+		command=${1:-}; shift || true
+		case $command in
+			test)
+				case ${2:-} in
+					/tmp/sd-vpnc-manager-ready) exit 0 ;;
+					/tmp/sd-vpnc-tun-ready) exit 0 ;;
+					/tmp/sd-vpnc-session-registry/registered/*) exit 0 ;;
+					esac
+				exit 1
+				;;
+			/usr/local/bin/sd-vpnc-entrypoint)
+				case ${1:-} in
+					status) printf 'ownership=sd-vpnc protocol=1 state=ACTIVE generation=fake live=0 stale=0 indeterminate=0\n'; exit 0 ;;
+					session)
+						id=${2:-}
+						: > "$RUNTIME_STATE.registered.$id"
+						exit 0
+						;;
+				esac
+				;;
+			/usr/local/bin/sd-vpnc-session-registry)
+				case ${1:-} in
+					release|stop-if-idle)
+						rm -f "$RUNTIME_STATE"
+						printf 'ownership=sd-vpnc protocol=1 state=STOPPING generation=fake live=0 stale=0 indeterminate=0\n'
+						exit 0
+						;;
+				esac
+				;;
+		esac
+		exit 0
+		;;
+	logs) exit 0 ;;
 esac
 exit 90
 ENGINE
@@ -999,7 +1065,7 @@ make_runtime_podman_path() {
 make_runtime_docker_path() {
 	DOCKER_RUNTIME_BIN="$CASE_DIR/runtime-docker-bin"
 	mkdir -p "$DOCKER_RUNTIME_BIN"
-	for utility in awk grep id mkdir rm sed sleep; do
+	for utility in awk cat chmod cmp date flock grep id mkdir mv od rm sed sleep tr; do
 		utility_path=$(command -v "$utility") || fail "missing runtime utility: $utility"
 		ln -s "$utility_path" "$DOCKER_RUNTIME_BIN/$utility"
 	done
@@ -1082,7 +1148,9 @@ prepare_runtime_cli_case runtime-podman-host-shell
 make_runtime_podman_path
 FAKE_ROOTLESS_STATUS=true
 output=$(run_runtime_cli ssh remote-host 2>&1) || fail "remote SSH host argument test failed: $output"
-assert_contains "$(cat "$RUNTIME_LOG")" '[ssh][remote-host]'
+assert_contains "$(cat "$RUNTIME_LOG")" '[session]'
+assert_contains "$(cat "$RUNTIME_LOG")" '[ssh]'
+assert_contains "$(cat "$RUNTIME_LOG")" '[remote-host]'
 
 prepare_runtime_cli_case runtime-docker-regular
 make_runtime_docker_path
@@ -1189,12 +1257,21 @@ for engine in podman docker; do
 done
 unset DEVPOD_WORKSPACE_ID DEVPOD_WORKSPACE_ID_OTHER DEVPOD_WORKSPACE SD_VPNC_FORWARD_CANARY
 
-# Existing-container `shell` execs the same selector used by the entrypoint.
+# `shell` starts the persistent manager and opens a registered exec session.
 prepare_runtime_cli_case runtime-shell-exec
 make_runtime_podman_path
+output=$(run_runtime_cli shell 2>&1) || fail "managed shell invocation failed: $output"
+assert_contains "$(cat "$RUNTIME_LOG")" '[--detach]'
+assert_contains "$(cat "$RUNTIME_LOG")" '[manager]'
+assert_contains "$(cat "$RUNTIME_LOG")" '[session]'
+
+# A running separate tunnel remains the preferred shell target.
+prepare_runtime_cli_case runtime-shell-prefers-tunnel
+make_runtime_podman_path
 : > "$RUNTIME_STATE"
-output=$(run_runtime_cli shell 2>&1) || fail "existing-container shell selector invocation failed: $output"
-assert_contains "$(cat "$RUNTIME_LOG")" '[/usr/local/bin/sd-vpnc-shell]'
+output=$(run_runtime_cli shell 2>&1) || fail "tunnel shell target preference failed: $output"
+assert_contains "$(cat "$RUNTIME_LOG")" "[exec][-it][sd-vpnc-tun-$(id -u)]"
+assert_not_contains "$(cat "$RUNTIME_LOG")" '[run]'
 
 # Use the host engines, not fake commands left at the front of PATH by the
 # command-argument tests. Engine smoke checks are conditional and report skips.

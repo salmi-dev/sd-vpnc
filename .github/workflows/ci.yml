@@ -23,12 +23,16 @@ jobs:
         run: |
           sh -n sd-vpnc
           sh -n tests/test-dotfiles-build.sh
+          sh -n tests/test-container-session-manager.sh
 
       - name: Run ShellCheck
-        run: shellcheck sd-vpnc tests/test-dotfiles-build.sh
+        run: shellcheck sd-vpnc tests/test-dotfiles-build.sh tests/test-container-session-manager.sh
 
       - name: Test image build behavior
         run: sh tests/test-dotfiles-build.sh
+
+      - name: Test shared VPN container sessions
+        run: sh tests/test-container-session-manager.sh
 
       - name: Smoke test command
         run: |
