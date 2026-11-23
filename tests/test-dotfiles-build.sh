@@ -387,7 +387,7 @@ assert_file_contains "$CONTAINERFILE_CAPTURE" 'ATUIN_HOME=/home/dev/.atuin'
 assert_file_contains "$CONTAINERFILE_CAPTURE" 'WORKDIR /work'
 assert_file_contains "$CAPTURE_DIR/entrypoint.sh" 'sd_vpnc_seed_home /usr/share/sd-vpnc/home-template'
 assert_file_contains "$CAPTURE_DIR/entrypoint.sh" '/usr/local/bin/sd-vpnc-shell'
-assert_file_contains "$CAPTURE_DIR/entrypoint.sh" 'openvpn --config "$vpn_config"'
+assert_file_contains "$CAPTURE_DIR/entrypoint.sh" "openvpn --config \"\$vpn_config\""
 assert_file_contains "$CAPTURE_DIR/sd-vpnc-session-registry" 'proc_identity()'
 assert_file_contains "$CAPTURE_DIR/sd-vpnc-session-registry" 'elapsed -ge 30'
 assert_file_contains "$CAPTURE_DIR/sd-vpnc-session-registry" 'acknowledge)'

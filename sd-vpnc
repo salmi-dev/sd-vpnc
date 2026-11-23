@@ -935,7 +935,9 @@ manifest_matches() {
 save_manager_manifest() {
 	candidate=$lifecycle_dir/manager-manifest.$$
 	(umask 077; emit_manager_manifest > "$candidate") || die "Cannot record VPN manager startup options."
-	chmod 600 "$candidate" && mv -f "$candidate" "$manager_manifest" || die "Cannot secure VPN manager startup options."
+	if ! chmod 600 "$candidate" || ! mv -f "$candidate" "$manager_manifest"; then
+		die "Cannot secure VPN manager startup options."
+	fi
 }
 
 manager_verify_owned() {
