@@ -71,6 +71,8 @@ ${BOLD}Commands${RESET}:
   ssh-tmux <ssh-host> [tmux-session] Connect SSH with an optional tmux session
   tun <ssh-host> <mapping...>        Start host-accessible local tunnels in background
   tun --stop                         Stop the background tunnel container
+  tun-add-port <mapping> [--yes]     Add one mapping to a managed tunnel
+  tun-rm-port <local-port> [--yes]   Remove one mapping from a managed tunnel
   shell                              Open a shell in the VPN container (starts it if needed)
   image [--rebuild]                  Build or rebuild the local container image
   version                            Print the version
@@ -771,6 +773,8 @@ credentials=${SD_VPNC_CREDENTIALS:-"$config_dir/credentials"}
 lifecycle_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/sd-vpnc
 lifecycle_lock=$lifecycle_dir/lifecycle.lock
 manager_manifest=$lifecycle_dir/manager.manifest
+tunnel_manifest=$lifecycle_dir/tunnel.manifest
+tunnel_pending=$lifecycle_dir/tunnel.pending
 rebuild=0
 
 init_cmd() {
@@ -873,8 +877,13 @@ require_flock() {
 
 lifecycle_lock() {
 	require_flock
+	[ ! -L "$lifecycle_dir" ] || die "The sd-vpnc state directory is a symbolic link; refusing lifecycle changes."
 	(umask 077; mkdir -p "$lifecycle_dir") || die "Cannot create the private sd-vpnc state directory."
+	[ -d "$lifecycle_dir" ] || die "The sd-vpnc state path is not a directory."
+	lifecycle_dir_owner=$(stat -c '%u' "$lifecycle_dir" 2>/dev/null || stat -f '%u' "$lifecycle_dir" 2>/dev/null) || die "Cannot verify the sd-vpnc state directory owner."
+	[ "$lifecycle_dir_owner" = "$(id -u)" ] || die "The sd-vpnc state directory is not owned by this user."
 	chmod 700 "$lifecycle_dir" || die "Cannot secure the private sd-vpnc state directory."
+	[ ! -L "$lifecycle_lock" ] || die "The sd-vpnc lifecycle lock is a symbolic link; refusing lifecycle changes."
 	exec 9>"$lifecycle_lock"
 	chmod 600 "$lifecycle_lock" || die "Cannot secure the sd-vpnc lifecycle lock."
 	flock -x 9 || die "Could not acquire the sd-vpnc lifecycle lock."
@@ -1106,7 +1115,7 @@ start_manager() {
 		-v "$ssh_mount" -v "$work_mount"
 	if [ -n "$credentials_mount" ]; then set -- "$@" -v "$credentials_mount"; fi
 	set -- "$@" "$IMAGE" manager
-	container_id=$(run_container_engine "$@") || die "Failed to start the VPN manager container."
+	run_container_engine "$@" >/dev/null || die "Failed to start the VPN manager container."
 	printf 'Starting VPN manager %s.\n' "$CONTAINER_NAME"
 	waited=0
 	while [ "$waited" -lt 120 ]; do
@@ -1347,23 +1356,636 @@ container_is_running() {
 	container_is_running_named "$CONTAINER_NAME"
 }
 
-stop_tun() {
-	detect_container || die "Neither podman nor docker is installed."
-	if ! container_exists_named "$TUN_CONTAINER_NAME"; then
-		printf 'No tunnel container is running.\n'
-		return 0
-	fi
-	if container_is_running_named "$TUN_CONTAINER_NAME"; then
-		"$container_command" container stop "$TUN_CONTAINER_NAME" >/dev/null
-	fi
-	"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || true
-	printf 'Stopped tunnel %s.\n' "$TUN_CONTAINER_NAME"
+tun_encode() {
+	printf '%s' "$1" | base64 | tr -d '\n'
 }
 
-prepare_image_rebuild() {
+tun_decode() {
+	tun_decode_value=
+	if tun_decode_value=$(printf '%s' "$1" | base64 -d 2>/dev/null); then
+		:
+	elif tun_decode_value=$(printf '%s' "$1" | base64 -D 2>/dev/null); then
+		:
+	else
+		return 1
+	fi
+	case $tun_decode_value in *'
+'*) return 1 ;; esac
+	[ "$(tun_encode "$tun_decode_value")" = "$1" ] || return 1
+	printf '%s' "$tun_decode_value"
+}
+
+normalize_tun_port() {
+	normalized_port=$1
+	case $normalized_port in ''|*[!0-9]*) return 1 ;; esac
+	normalized_port=$(printf '%s' "$normalized_port" | sed 's/^0*//')
+	[ -n "$normalized_port" ] || normalized_port=0
+	[ "${#normalized_port}" -le 5 ] || return 1
+	awk -v port="$normalized_port" 'BEGIN { exit !(port >= 1 && port <= 65535) }' || return 1
+}
+
+validate_tun_mapping() {
+	tm_validate_value=$1
+	case $tm_validate_value in
+		*:*:*)
+			tm_validate_local=${tm_validate_value%%:*}
+			tm_validate_rest=${tm_validate_value#*:}
+			tm_validate_host=${tm_validate_rest%:*}
+			tm_validate_remote=${tm_validate_rest##*:}
+			case $tm_validate_rest in *:*:*) return 1 ;; esac
+			case $tm_validate_host in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+			;;
+		*:) return 1 ;;
+		*:*)
+			tm_validate_local=${tm_validate_value%%:*}
+			tm_validate_host=localhost
+			tm_validate_remote=${tm_validate_value#*:}
+			;;
+		*) return 1 ;;
+	esac
+	normalize_tun_port "$tm_validate_local" || return 1
+	tm_validate_local_number=$normalized_port
+	normalize_tun_port "$tm_validate_remote" || return 1
+}
+
+tunnel_state_dir_private() {
+	[ ! -L "$lifecycle_dir" ] && [ -d "$lifecycle_dir" ] || return 1
+	tun_state_owner=$(stat -c '%u' "$lifecycle_dir" 2>/dev/null || stat -f '%u' "$lifecycle_dir" 2>/dev/null) || return 1
+	tun_state_mode=$(stat -c '%a' "$lifecycle_dir" 2>/dev/null || stat -f '%Lp' "$lifecycle_dir" 2>/dev/null) || return 1
+	[ "$tun_state_owner" = "$(id -u)" ] && [ "$tun_state_mode" = 700 ]
+}
+
+tunnel_manifest_private() {
+	tunnel_state_dir_private || return 1
+	[ ! -L "$tunnel_manifest" ] && [ -f "$tunnel_manifest" ] || return 1
+	tun_manifest_owner=$(stat -c '%u' "$tunnel_manifest" 2>/dev/null || stat -f '%u' "$tunnel_manifest" 2>/dev/null) || return 1
+	tun_manifest_mode=$(stat -c '%a' "$tunnel_manifest" 2>/dev/null || stat -f '%Lp' "$tunnel_manifest" 2>/dev/null) || return 1
+	[ "$tun_manifest_owner" = "$(id -u)" ] && [ "$tun_manifest_mode" = 600 ] || return 1
+	tun_manifest_size=$(wc -c < "$tunnel_manifest" | tr -d ' ')
+	[ "$tun_manifest_size" -le 65536 ] || return 1
+	[ "$(tail -c 1 "$tunnel_manifest" | wc -l | tr -d ' ')" = 1 ]
+}
+
+tunnel_pending_private() {
+	tunnel_state_dir_private || return 1
+	[ ! -L "$tunnel_pending" ] && [ -f "$tunnel_pending" ] || return 1
+	tun_pending_owner=$(stat -c '%u' "$tunnel_pending" 2>/dev/null || stat -f '%u' "$tunnel_pending" 2>/dev/null) || return 1
+	tun_pending_mode=$(stat -c '%a' "$tunnel_pending" 2>/dev/null || stat -f '%Lp' "$tunnel_pending" 2>/dev/null) || return 1
+	[ "$tun_pending_owner" = "$(id -u)" ] && [ "$tun_pending_mode" = 600 ] || return 1
+	tun_pending_size=$(wc -c < "$tunnel_pending" | tr -d ' ')
+	[ "$tun_pending_size" -le 65536 ] || return 1
+	[ "$(tail -c 1 "$tunnel_pending" | wc -l | tr -d ' ')" = 1 ]
+}
+
+validate_tun_container_id() {
+	case $1 in ''|*[!0-9a-f]*) return 1 ;; esac
+	[ "${#1}" -eq 64 ]
+}
+
+validate_tun_runtime_id_prefix() {
+	case $1 in ''|*[!0-9a-f]*) return 1 ;; esac
+	[ "${#1}" -le 64 ]
+}
+
+parse_tunnel_manifest() {
+	tunnel_manifest_private || return 1
+	tm_version='' tm_container_id='' tm_host='' tm_mapping_count='' tm_engine='' tm_engine_context=''
+	tm_uid='' tm_gid='' tm_image='' tm_workdir='' tm_config_dir='' tm_config=''
+	tm_credentials_present='' tm_credentials='' tm_ssh_source='' tm_mount_mode=''
+	tm_workspace_present='' tm_workspace_value='' tm_mappings=''
+	tm_seen_version=0 tm_seen_container_id=0 tm_seen_host=0 tm_seen_mapping_count=0
+	tm_seen_engine=0 tm_seen_engine_context=0 tm_seen_uid=0 tm_seen_gid=0 tm_seen_image=0
+	tm_seen_workdir=0 tm_seen_config_dir=0 tm_seen_config=0 tm_seen_credentials_present=0
+	tm_seen_credentials=0 tm_seen_ssh_source=0 tm_seen_mount_mode=0 tm_seen_workspace_present=0
+	tm_seen_workspace_value=0 tm_mapping_fields=0 tm_line_count=1 tm_seen_local_ports=
+	IFS= read -r tm_header < "$tunnel_manifest" || return 1
+	[ "$tm_header" = SDVPNC-TUN-MANIFEST ] || return 1
+	tm_skip_header=1
+	while IFS= read -r tm_line || [ -n "$tm_line" ]; do
+		if [ "$tm_skip_header" = 1 ]; then
+			[ "$tm_line" = "$tm_header" ] || return 1
+			tm_skip_header=0
+			continue
+		fi
+		tm_line_count=$((tm_line_count + 1))
+		case $tm_line in *=*) ;; *) return 1 ;; esac
+		tm_key=${tm_line%%=*}
+		tm_encoded=${tm_line#*=}
+		tm_value=$(tun_decode "$tm_encoded") || return 1
+		case $tm_key in
+			version) [ "$tm_seen_version" = 0 ] || return 1; tm_version=$tm_value; tm_seen_version=1 ;;
+			container_id) [ "$tm_seen_container_id" = 0 ] || return 1; tm_container_id=$tm_value; tm_seen_container_id=1 ;;
+			host) [ "$tm_seen_host" = 0 ] || return 1; tm_host=$tm_value; tm_seen_host=1 ;;
+			mapping_count) [ "$tm_seen_mapping_count" = 0 ] || return 1; tm_mapping_count=$tm_value; tm_seen_mapping_count=1 ;;
+			engine) [ "$tm_seen_engine" = 0 ] || return 1; tm_engine=$tm_value; tm_seen_engine=1 ;;
+			engine_context) [ "$tm_seen_engine_context" = 0 ] || return 1; tm_engine_context=$tm_value; tm_seen_engine_context=1 ;;
+			uid) [ "$tm_seen_uid" = 0 ] || return 1; tm_uid=$tm_value; tm_seen_uid=1 ;;
+			gid) [ "$tm_seen_gid" = 0 ] || return 1; tm_gid=$tm_value; tm_seen_gid=1 ;;
+			image) [ "$tm_seen_image" = 0 ] || return 1; tm_image=$tm_value; tm_seen_image=1 ;;
+			workdir) [ "$tm_seen_workdir" = 0 ] || return 1; tm_workdir=$tm_value; tm_seen_workdir=1 ;;
+			config_dir) [ "$tm_seen_config_dir" = 0 ] || return 1; tm_config_dir=$tm_value; tm_seen_config_dir=1 ;;
+			config) [ "$tm_seen_config" = 0 ] || return 1; tm_config=$tm_value; tm_seen_config=1 ;;
+			credentials_present) [ "$tm_seen_credentials_present" = 0 ] || return 1; tm_credentials_present=$tm_value; tm_seen_credentials_present=1 ;;
+			credentials) [ "$tm_seen_credentials" = 0 ] || return 1; tm_credentials=$tm_value; tm_seen_credentials=1 ;;
+			ssh_source) [ "$tm_seen_ssh_source" = 0 ] || return 1; tm_ssh_source=$tm_value; tm_seen_ssh_source=1 ;;
+			mount_mode) [ "$tm_seen_mount_mode" = 0 ] || return 1; tm_mount_mode=$tm_value; tm_seen_mount_mode=1 ;;
+			workspace_present) [ "$tm_seen_workspace_present" = 0 ] || return 1; tm_workspace_present=$tm_value; tm_seen_workspace_present=1 ;;
+			workspace_value) [ "$tm_seen_workspace_value" = 0 ] || return 1; tm_workspace_value=$tm_value; tm_seen_workspace_value=1 ;;
+			mapping.*)
+				tm_mapping_index=${tm_key#mapping.}
+				case $tm_mapping_index in ''|*[!0-9]*) return 1 ;; esac
+				tm_expected_index=$((tm_mapping_fields + 1))
+				[ "$tm_mapping_index" = "$tm_expected_index" ] || return 1
+				validate_tun_mapping "$tm_value" || return 1
+				case " $tm_seen_local_ports " in *" $tm_validate_local_number "*) return 1 ;; esac
+				tm_seen_local_ports="${tm_seen_local_ports:-} $tm_validate_local_number"
+				tm_mappings="${tm_mappings}${tm_mappings:+ }$tm_value"
+				tm_mapping_fields=$((tm_mapping_fields + 1))
+				;;
+			*) return 1 ;;
+		esac
+	done < "$tunnel_manifest"
+	[ "$tm_line_count" -eq "$((19 + tm_mapping_fields))" ] || return 1
+	[ "$tm_version" = 1 ] && [ "$tm_mapping_count" = "$tm_mapping_fields" ] && [ "$tm_mapping_count" -gt 0 ] || return 1
+	[ "$tm_seen_version$tm_seen_container_id$tm_seen_host$tm_seen_mapping_count$tm_seen_engine$tm_seen_engine_context$tm_seen_uid$tm_seen_gid$tm_seen_image$tm_seen_workdir$tm_seen_config_dir$tm_seen_config$tm_seen_credentials_present$tm_seen_credentials$tm_seen_ssh_source$tm_seen_mount_mode$tm_seen_workspace_present$tm_seen_workspace_value" = 111111111111111111 ] || return 1
+	case $tm_engine in podman|docker) ;; *) return 1 ;; esac
+	case $tm_uid:$tm_gid in *[!0-9:]*) return 1 ;; esac
+	case $tm_credentials_present:$tm_workspace_present in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+	case $tm_mount_mode in podman-rootless|podman-rootful|docker) ;; *) return 1 ;; esac
+	validate_tun_container_id "$tm_container_id" || return 1
+	[ -n "$tm_host" ] && [ -n "$tm_image" ] || return 1
+	case $tm_workdir:$tm_config_dir:$tm_config:$tm_credentials:$tm_ssh_source in /*:/*:/*:/*:/*) ;; *) return 1 ;; esac
+	case $tm_engine:$tm_mount_mode in podman:docker|docker:podman-rootless|docker:podman-rootful) return 1 ;; esac
+	return 0
+}
+
+parse_tunnel_pending() {
+	tunnel_pending_private || return 1
+	tp_version='' tp_operation='' tp_old_container_id='' tp_replacement_container_id=''
+	tp_mapping_count='' tp_mappings=''
+	tp_seen_version=0 tp_seen_operation=0 tp_seen_old_id=0 tp_seen_replacement_id=0
+	tp_seen_mapping_count=0 tp_mapping_fields=0 tp_line_count=1 tp_seen_local_ports=
+	IFS= read -r tp_header < "$tunnel_pending" || return 1
+	[ "$tp_header" = SDVPNC-TUN-PENDING ] || return 1
+	tp_skip_header=1
+	while IFS= read -r tp_line || [ -n "$tp_line" ]; do
+		if [ "$tp_skip_header" = 1 ]; then
+			[ "$tp_line" = "$tp_header" ] || return 1
+			tp_skip_header=0
+			continue
+		fi
+		tp_line_count=$((tp_line_count + 1))
+		case $tp_line in *=*) ;; *) return 1 ;; esac
+		tp_key=${tp_line%%=*}
+		tp_encoded=${tp_line#*=}
+		tp_value=$(tun_decode "$tp_encoded") || return 1
+		case $tp_key in
+			version) [ "$tp_seen_version" = 0 ] || return 1; tp_version=$tp_value; tp_seen_version=1 ;;
+			operation) [ "$tp_seen_operation" = 0 ] || return 1; tp_operation=$tp_value; tp_seen_operation=1 ;;
+			old_container_id) [ "$tp_seen_old_id" = 0 ] || return 1; tp_old_container_id=$tp_value; tp_seen_old_id=1 ;;
+			replacement_container_id) [ "$tp_seen_replacement_id" = 0 ] || return 1; tp_replacement_container_id=$tp_value; tp_seen_replacement_id=1 ;;
+			mapping_count) [ "$tp_seen_mapping_count" = 0 ] || return 1; tp_mapping_count=$tp_value; tp_seen_mapping_count=1 ;;
+			mapping.*)
+				tp_mapping_index=${tp_key#mapping.}
+				case $tp_mapping_index in ''|*[!0-9]*) return 1 ;; esac
+				tp_expected_index=$((tp_mapping_fields + 1))
+				[ "$tp_mapping_index" = "$tp_expected_index" ] || return 1
+				validate_tun_mapping "$tp_value" || return 1
+				case " $tp_seen_local_ports " in *" $tm_validate_local_number "*) return 1 ;; esac
+				tp_seen_local_ports="${tp_seen_local_ports:-} $tm_validate_local_number"
+				tp_mappings="${tp_mappings}${tp_mappings:+ }$tp_value"
+				tp_mapping_fields=$((tp_mapping_fields + 1))
+				;;
+			*) return 1 ;;
+		esac
+	done < "$tunnel_pending"
+	[ "$tp_line_count" -eq "$((6 + tp_mapping_fields))" ] || return 1
+	[ "$tp_seen_version$tp_seen_operation$tp_seen_old_id$tp_seen_replacement_id$tp_seen_mapping_count" = 11111 ] || return 1
+	[ "$tp_version" = 1 ] && [ "$tp_mapping_count" = "$tp_mapping_fields" ] || return 1
+	case $tp_operation in initial|add|remove) ;; *) return 1 ;; esac
+	case $tp_old_container_id in
+		none) [ "$tp_operation" = initial ] || return 1 ;;
+		*) [ "$tp_operation" != initial ] && validate_tun_container_id "$tp_old_container_id" || return 1 ;;
+	esac
+	case $tp_replacement_container_id in none) ;; *) validate_tun_container_id "$tp_replacement_container_id" || return 1 ;; esac
+	if [ "$tp_operation" = initial ] || [ "$tp_operation" = add ]; then [ "$tp_mapping_count" -gt 0 ] || return 1; fi
+	return 0
+}
+
+write_tunnel_manifest() {
+	validate_tun_container_id "$tm_container_id" || return 1
+	tm_write_tmp=$(mktemp "$lifecycle_dir/.tunnel.manifest.XXXXXX") || return 1
+	(
+		umask 077
+		{
+			printf '%s\n' SDVPNC-TUN-MANIFEST
+			printf 'version=%s\n' "$(tun_encode 1)"
+			printf 'container_id=%s\n' "$(tun_encode "$tm_container_id")"
+			printf 'host=%s\n' "$(tun_encode "$tm_host")"
+			set -f
+			tm_save_ifs=$IFS
+			IFS=' '
+			# shellcheck disable=SC2086
+			set -- $tm_mappings
+			IFS=$tm_save_ifs
+			printf 'mapping_count=%s\n' "$(tun_encode "$#")"
+			tm_write_index=1
+			for tm_write_mapping do
+				printf 'mapping.%s=%s\n' "$tm_write_index" "$(tun_encode "$tm_write_mapping")"
+				tm_write_index=$((tm_write_index + 1))
+			done
+			printf 'engine=%s\n' "$(tun_encode "$tm_engine")"
+			printf 'engine_context=%s\n' "$(tun_encode "$tm_engine_context")"
+			printf 'uid=%s\n' "$(tun_encode "$tm_uid")"
+			printf 'gid=%s\n' "$(tun_encode "$tm_gid")"
+			printf 'image=%s\n' "$(tun_encode "$tm_image")"
+			printf 'workdir=%s\n' "$(tun_encode "$tm_workdir")"
+			printf 'config_dir=%s\n' "$(tun_encode "$tm_config_dir")"
+			printf 'config=%s\n' "$(tun_encode "$tm_config")"
+			printf 'credentials_present=%s\n' "$(tun_encode "$tm_credentials_present")"
+			printf 'credentials=%s\n' "$(tun_encode "$tm_credentials")"
+			printf 'ssh_source=%s\n' "$(tun_encode "$tm_ssh_source")"
+			printf 'mount_mode=%s\n' "$(tun_encode "$tm_mount_mode")"
+			printf 'workspace_present=%s\n' "$(tun_encode "$tm_workspace_present")"
+			printf 'workspace_value=%s\n' "$(tun_encode "$tm_workspace_value")"
+		} > "$tm_write_tmp"
+	) || { rm -f "$tm_write_tmp"; return 1; }
+	chmod 600 "$tm_write_tmp" || { rm -f "$tm_write_tmp"; return 1; }
+	mv -f "$tm_write_tmp" "$tunnel_manifest" || { rm -f "$tm_write_tmp"; return 1; }
+}
+
+write_tunnel_pending() {
+	case ${tm_container_id:-none} in none) ;; *) validate_tun_container_id "$tm_container_id" || return 1 ;; esac
+	case ${tm_pending_replacement_id:-none} in none) ;; *) validate_tun_container_id "$tm_pending_replacement_id" || return 1 ;; esac
+	tm_pending_tmp=$(mktemp "$lifecycle_dir/.tunnel.pending.XXXXXX") || return 1
+	(
+		umask 077
+		{
+			printf '%s\n' SDVPNC-TUN-PENDING
+			printf 'version=%s\n' "$(tun_encode 1)"
+			printf 'operation=%s\n' "$(tun_encode "$tm_pending_operation")"
+			printf 'old_container_id=%s\n' "$(tun_encode "${tm_container_id:-none}")"
+			printf 'replacement_container_id=%s\n' "$(tun_encode "${tm_pending_replacement_id:-none}")"
+			set -f
+			tm_pending_ifs=$IFS
+			IFS=' '
+			# shellcheck disable=SC2086
+			set -- ${tm_pending_mappings:-}
+			IFS=$tm_pending_ifs
+			printf 'mapping_count=%s\n' "$(tun_encode "$#")"
+			tm_pending_index=1
+			for tm_pending_mapping do
+				printf 'mapping.%s=%s\n' "$tm_pending_index" "$(tun_encode "$tm_pending_mapping")"
+				tm_pending_index=$((tm_pending_index + 1))
+			done
+		} > "$tm_pending_tmp"
+	) || { rm -f "$tm_pending_tmp"; return 1; }
+	if ! chmod 600 "$tm_pending_tmp" || ! mv -f "$tm_pending_tmp" "$tunnel_pending"; then
+		rm -f "$tm_pending_tmp"
+		return 1
+	fi
+}
+
+
+tun_inspect_identity() {
+	tun_inspected_id=
+	tun_inspected_label=
+	tun_inspected_id=$("$container_command" container inspect --format '{{.Id}}' "$TUN_CONTAINER_NAME" 2>/dev/null) || return 1
+	tun_inspected_label=$("$container_command" container inspect --format '{{ index .Config.Labels "io.sd-vpnc.tunnel" }}' "$TUN_CONTAINER_NAME" 2>/dev/null) || return 1
+	validate_tun_container_id "$tun_inspected_id" && [ "$tun_inspected_label" = sd-vpnc ]
+}
+
+tun_current_engine_context() {
+	case $container_command in
+		podman)
+			if [ -n "${CONTAINER_CONNECTION:-}" ]; then
+				printf '%s' "$CONTAINER_CONNECTION"
+			else
+				podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null
+			fi
+			;;
+		docker)
+			if [ -n "${DOCKER_CONTEXT:-}" ]; then
+				printf '%s' "$DOCKER_CONTEXT"
+			else
+				docker context show 2>/dev/null
+			fi
+			;;
+		*) return 1 ;;
+	esac
+}
+
+tun_current_mount_mode() {
+	case $container_command in
+		podman)
+			tun_rootless_status=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null) || return 1
+			case $tun_rootless_status in true) printf '%s' podman-rootless ;; false) printf '%s' podman-rootful ;; *) return 1 ;; esac
+			;;
+		docker) printf '%s' docker ;;
+		*) return 1 ;;
+	esac
+}
+
+tun_validate_saved_sources() {
+	[ -d "$tm_workdir" ] && [ -d "$tm_config_dir" ] && [ -f "$tm_config" ] && [ -d "$tm_ssh_source" ] || return 1
+	if [ "$tm_credentials_present" = 1 ]; then [ -f "$tm_credentials" ] || return 1; fi
+}
+
+tun_validate_current_options() {
+	tun_current_context=$(tun_current_engine_context) || return 1
+	tun_current_mode=$(tun_current_mount_mode) || return 1
+	[ "$container_command" = "$tm_engine" ] && [ "$tun_current_context" = "$tm_engine_context" ] || return 1
+	[ "$tun_current_mode" = "$tm_mount_mode" ] || return 1
+	[ "$(id -u)" = "$tm_uid" ] && [ "$(id -g)" = "$tm_gid" ] || return 1
+	[ -d "$workdir" ] && [ -d "$config_dir" ] && [ -f "$config" ] && [ -d "$ssh_config" ] || return 1
+	if [ "$(canonical_path "$workdir")" != "$tm_workdir" ] || \
+		[ "$(canonical_path "$config_dir")" != "$tm_config_dir" ] || \
+		[ "$(canonical_path "$config")" != "$tm_config" ] || \
+		[ "$(canonical_path "$credentials")" != "$tm_credentials" ] || \
+		[ "$(canonical_path "$ssh_config")" != "$tm_ssh_source" ]; then
+		return 1
+	fi
+	if [ "$tm_credentials_present" = 1 ]; then [ -f "$credentials" ] || return 1; fi
+	if [ "${DEVPOD_WORKSPACE_ID+x}" = x ]; then
+		[ "$tm_workspace_present" = 1 ] && [ "${DEVPOD_WORKSPACE_ID}" = "$tm_workspace_value" ] || return 1
+	else
+		[ "$tm_workspace_present" = 0 ] || return 1
+	fi
+	tun_validate_saved_sources
+}
+
+tun_require_valid_active_state() {
+	if [ -e "$tunnel_pending" ] || [ -L "$tunnel_pending" ]; then
+		printf "An interrupted tunnel transaction is pending. Run '%s tun --stop', then start a fresh tunnel.\n" "$PROGRAM" >&2
+		return 1
+	fi
+	parse_tunnel_manifest || {
+		printf "No valid private managed tunnel state is available. Run '%s tun --stop', then start fresh with '%s tun HOST MAPPING...'.\n" "$PROGRAM" "$PROGRAM" >&2
+		return 1
+	}
+	tun_validate_current_options || {
+		printf "The tunnel engine, context, mounts, or startup configuration paths differ from the saved state. Run '%s tun --stop' and start a fresh tunnel.\n" "$PROGRAM" >&2
+		return 1
+	}
+	tun_validate_saved_sources || {
+		printf "A saved tunnel startup source is missing or invalid. Run '%s tun --stop' and start a fresh tunnel.\n" "$PROGRAM" >&2
+		return 1
+	}
+	if ! container_is_running_named "$TUN_CONTAINER_NAME" || ! tun_inspect_identity || [ "$tun_inspected_id" != "$tm_container_id" ]; then
+		printf "The named tunnel is not a running, verified managed container matching its manifest. Run '%s tun --stop', then start fresh with '%s tun HOST MAPPING...'.\n" "$PROGRAM" "$PROGRAM" >&2
+		return 1
+	fi
+	return 0
+}
+
+tun_capture_initial_state() {
+	tm_host=$tun_initial_host
+	tm_mappings=$tun_initial_mappings
+	tm_mapping_count=$tun_initial_mapping_count
+	tm_engine=$container_command
+	tm_engine_context=$(tun_current_engine_context) || return 1
+	tm_uid=$(id -u)
+	tm_gid=$(id -g)
+	tm_image=$IMAGE
+	tm_workdir=$(canonical_path "$workdir") || return 1
+	tm_config_dir=$(canonical_path "$config_dir") || return 1
+	tm_config=$(canonical_path "$config") || return 1
+	tm_credentials=$(canonical_path "$credentials") || return 1
+	tm_ssh_source=$(canonical_path "$ssh_config") || return 1
+	if [ -f "$credentials" ]; then tm_credentials_present=1; else tm_credentials_present=0; fi
+	configure_runtime_mounts
+	case $container_command:$podman_rootless in
+		podman:true) tm_mount_mode=podman-rootless ;;
+		podman:false) tm_mount_mode=podman-rootful ;;
+		docker:false) tm_mount_mode=docker ;;
+		*) return 1 ;;
+	esac
+	if [ "${DEVPOD_WORKSPACE_ID+x}" = x ]; then
+		tm_workspace_present=1
+		tm_workspace_value=$DEVPOD_WORKSPACE_ID
+	else
+		tm_workspace_present=0
+		tm_workspace_value=
+	fi
+	case $tm_host:$tm_engine_context:$tm_workdir:$tm_config_dir:$tm_config:$tm_credentials:$tm_ssh_source:$tm_workspace_value in *'
+'*) return 1 ;; esac
+	tun_validate_saved_sources
+}
+
+tun_apply_saved_runtime() {
+	uid=$tm_uid
+	gid=$tm_gid
+	case $tm_mount_mode in podman-rootless) podman_rootless=true ;; *) podman_rootless=false ;; esac
+	home_tmpfs_args "$uid" "$gid"
+	devpod_env_arg=
+	if [ "$tm_workspace_present" = 1 ] && [ -n "$tm_workspace_value" ]; then devpod_env_arg="DEVPOD_WORKSPACE_ID=$tm_workspace_value"; fi
+	tun_relabel=
+	tun_config_mount=$tm_config_dir:/config:ro
+	tun_config_file_mount=$tm_config:/config/client.ovpn:ro
+	tun_ssh_mount=$tm_ssh_source:/home/dev/.ssh:ro
+	tun_work_mount=$tm_workdir:/work
+	if [ "$tm_mount_mode" = podman-rootless ]; then
+		tun_relabel=,z
+		tun_config_mount="$tun_config_mount,z"
+		tun_config_file_mount="$tun_config_file_mount,z"
+		tun_ssh_mount="$tun_ssh_mount,z"
+		tun_work_mount="$tun_work_mount:z"
+	fi
+}
+
+tun_container_authoritative_state() {
+	tun_state_expected_ids=$1
+	tun_authoritative_state=uncertain
+	tun_listed_containers=$("$container_command" container ls --all --no-trunc --format '{{.ID}}|{{.Names}}' 2>/dev/null && printf '\001') || return 1
+	tun_authoritative_state=absent
+	tun_listed_containers=${tun_listed_containers%?}
+	set -f
+	tun_saved_ifs=$IFS
+	IFS=' '
+	if [ -n "$tun_state_expected_ids" ]; then
+		# shellcheck disable=SC2086
+		set -- $tun_state_expected_ids
+	else
+		set --
+	fi
+	IFS=$tun_saved_ifs
+	for tun_state_expected_id do validate_tun_runtime_id_prefix "$tun_state_expected_id" || return 1; done
+	tun_list_newline='
+'
+	tun_list_carriage_return=$(printf '\r')
+	while [ -n "$tun_listed_containers" ]; do
+		case $tun_listed_containers in
+			*"$tun_list_newline"*)
+				tun_listed_row=${tun_listed_containers%%"$tun_list_newline"*}
+				tun_listed_containers=${tun_listed_containers#*"$tun_list_newline"}
+				[ -n "$tun_listed_row" ] || return 1
+				;;
+			*) tun_listed_row=$tun_listed_containers; tun_listed_containers= ;;
+		esac
+		case $tun_listed_row in
+			*'|'*)
+				tun_listed_id=${tun_listed_row%%|*}
+				tun_listed_name=${tun_listed_row#*|}
+				case $tun_listed_name in *'|'*) return 1 ;; esac
+				;;
+			*) return 1 ;;
+		esac
+		case $tun_listed_id in ''|*' '*|*'	'*|*"$tun_list_carriage_return"*|*'|'*) return 1 ;; esac
+		case $tun_listed_name in ''|*' '*|*'	'*|*"$tun_list_carriage_return"*|*'|'*) return 1 ;; esac
+		tun_listed_id_matches=0
+		for tun_state_expected_id do
+			case $tun_listed_id in "$tun_state_expected_id"*) tun_listed_id_matches=1 ;; esac
+			case $tun_state_expected_id in "$tun_listed_id"*) tun_listed_id_matches=1 ;; esac
+		done
+		if [ "$tun_listed_name" = "$TUN_CONTAINER_NAME" ]; then
+			[ "$tun_authoritative_state" = absent ] || return 1
+			tun_authoritative_state=present
+			if [ "$#" -gt 0 ] && [ "$tun_listed_id_matches" != 1 ]; then return 1; fi
+		elif [ "$tun_listed_id_matches" = 1 ]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+tun_created_container_running() {
+	tun_created_running=$("$container_command" container inspect --format '{{.State.Running}}' "$TUN_CONTAINER_NAME" 2>/dev/null) || return 1
+	case $tun_created_running in true|false) return 0 ;; *) return 1 ;; esac
+}
+
+tun_remove_created_container() {
+	tun_remove_expected_id=$1
+	validate_tun_runtime_id_prefix "$tun_remove_expected_id" || return 1
+	tun_container_authoritative_state "$tun_remove_expected_id" || return 1
+	[ "$tun_authoritative_state" = present ] || return 0
+	tun_inspect_identity || return 1
+	case $tun_inspected_id in "$tun_remove_expected_id"*) ;; *) return 1 ;; esac
+	tun_created_container_running || return 1
+	if [ "$tun_created_running" = true ]; then
+		"$container_command" container stop "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || return 1
+		tun_container_authoritative_state "$tun_remove_expected_id" || return 1
+		[ "$tun_authoritative_state" = absent ] && return 0
+		[ "$tun_authoritative_state" = present ] || return 1
+		tun_inspect_identity || return 1
+		case $tun_inspected_id in "$tun_remove_expected_id"*) ;; *) return 1 ;; esac
+		tun_created_container_running || return 1
+		[ "$tun_created_running" = false ] || return 1
+	fi
+	"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || true
+	tun_container_authoritative_state "$tun_remove_expected_id" || return 1
+	[ "$tun_authoritative_state" = absent ]
+}
+
+tun_remove_named_container() {
+	tun_named_expected_id=$1
+	tun_container_authoritative_state "$tun_named_expected_id" || return 1
+	case $tun_authoritative_state in
+		absent) return 0 ;;
+		present) ;;
+		*) return 1 ;;
+	esac
+	tun_named_running=unknown
+	if tun_named_running=$("$container_command" container inspect --format '{{.State.Running}}' "$TUN_CONTAINER_NAME" 2>/dev/null); then
+		case $tun_named_running in true|false) ;; *) tun_named_running=unknown ;; esac
+	fi
+	case $tun_named_running in
+		true|unknown) "$container_command" container stop "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || true ;;
+	esac
+	"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || true
+	tun_container_authoritative_state "$tun_named_expected_id" || return 1
+	[ "$tun_authoritative_state" = absent ]
+}
+
+tun_wait_ready() {
+	tun_wait_id=$1
+	tun_waited=0
+	while [ "$tun_waited" -lt 110 ]; do
+		if ! tun_inspect_identity || [ "$tun_inspected_id" != "$tun_wait_id" ] || ! container_is_running_named "$TUN_CONTAINER_NAME"; then
+			"$container_command" logs "$TUN_CONTAINER_NAME" >&2 2>/dev/null || true
+			tun_remove_created_container "$tun_wait_id" || return 2
+			return 1
+		fi
+		if "$container_command" exec "$TUN_CONTAINER_NAME" test -f /tmp/sd-vpnc-tun-ready >/dev/null 2>&1; then return 0; fi
+		sleep 1
+		tun_waited=$((tun_waited + 1))
+	done
+	tun_remove_created_container "$tun_wait_id" || return 2
+	return 1
+}
+
+tun_start_saved_configuration() {
+	tun_validate_saved_sources || return 1
+	tun_apply_saved_runtime
+	set -- run --detach \
+		--name "$TUN_CONTAINER_NAME" \
+		--label io.sd-vpnc.tunnel=sd-vpnc \
+		--cap-add=NET_ADMIN \
+		--device /dev/net/tun \
+		--user "$uid:$gid" \
+		"$home_tmpfs_flag" "$home_tmpfs_value" \
+		--workdir /home/dev \
+		-e HOME=/home/dev
+	if [ -n "$devpod_env_arg" ]; then set -- "$@" -e "$devpod_env_arg"; fi
+	set -- "$@" -v "$tun_config_mount" -v "$tun_config_file_mount" -v "$tun_ssh_mount" -v "$tun_work_mount"
+	if [ "$tm_credentials_present" = 1 ]; then set -- "$@" -v "$tm_credentials:/config/credentials:ro$tun_relabel"; fi
+	set -f
+	tun_save_ifs=$IFS
+	IFS=' '
+	for tun_start_mapping in $tm_mappings; do
+		validate_tun_mapping "$tun_start_mapping" || return 1
+		set -- "$@" -p "127.0.0.1:$tm_validate_local_number:$tm_validate_local_number"
+	done
+	IFS=$tun_save_ifs
+	set -- "$@" "$tm_image" tun "$tm_host"
+	for tun_start_mapping in $tm_mappings; do set -- "$@" "$tun_start_mapping"; done
+	tm_started_container_id=
+	tun_started_id=$(run_container_engine "$@") || return 1
+	[ -n "$tun_started_id" ] || return 1
+	validate_tun_runtime_id_prefix "$tun_started_id" || return 1
+	tm_started_container_id=$tun_started_id
+	if tun_inspect_identity; then
+		tun_new_inspected_id=$tun_inspected_id
+		case $tun_new_inspected_id in "$tun_started_id"*) ;; *) return 1 ;; esac
+		tm_started_container_id=$tun_inspected_id
+		tm_pending_replacement_id=$tun_inspected_id
+		write_tunnel_pending || return 1
+	else
+		return 1
+	fi
+	[ "$tun_inspected_label" = sd-vpnc ] || return 1
+	tun_wait_ready "$tun_new_inspected_id" || return $?
+	tm_container_id=$tun_new_inspected_id
+	return 0
+}
+
+stop_tun() {
 	detect_container || die "Neither podman nor docker is installed."
-	require_flock
 	lifecycle_lock
+	"$container_command" info >/dev/null 2>&1 || die "Cannot verify the container engine; tunnel state was left untouched."
+	tun_stop_known_ids=
+	if [ -e "$tunnel_manifest" ] || [ -L "$tunnel_manifest" ]; then
+		if parse_tunnel_manifest; then tun_stop_known_ids=$tm_container_id; fi
+	fi
+	if [ -e "$tunnel_pending" ] || [ -L "$tunnel_pending" ]; then
+		parse_tunnel_pending || die "The pending tunnel record is invalid or inaccessible; its state was retained. Inspect and clean up containers manually, then retry '$PROGRAM tun --stop'."
+		for tun_stop_id in "$tp_old_container_id" "$tp_replacement_container_id"; do
+			case $tun_stop_id in none) ;; *) tun_stop_known_ids="${tun_stop_known_ids}${tun_stop_known_ids:+ }$tun_stop_id" ;; esac
+		done
+	fi
+	tun_container_authoritative_state "$tun_stop_known_ids" || die "A saved tunnel ID may still exist under another name, or the exact target could not be verified; tunnel state was retained. Explicitly inspect and manually clean up the saved container ID(s), then retry '$PROGRAM tun --stop'."
+	case $tun_authoritative_state in
+		present)
+			tun_remove_named_container "$tun_stop_known_ids" || die "Could not verify removal of the exact tunnel target '$TUN_CONTAINER_NAME'; tunnel state was retained. Retry '$PROGRAM tun --stop' or inspect the saved container IDs manually."
+			printf 'Stopped tunnel %s.\n' "$TUN_CONTAINER_NAME"
+			;;
+		absent) printf 'No tunnel container is running.\n' ;;
+		*) die "Could not determine whether the exact tunnel target exists; tunnel state was retained. Retry '$PROGRAM tun --stop' for recovery." ;;
+	esac
+	rm -f "$tunnel_manifest" "$tunnel_pending" || die "The tunnel is absent, but its recovery state could not be cleared. Retry '$PROGRAM tun --stop'."
+	lifecycle_unlock
+}
+
+prepare_image_rebuild_locked() {
 	if manager_exists_owned; then
 		if manager_is_running; then
 			rebuild_report=$(manager_status) || die "Could not reconcile VPN sessions; leaving the manager running."
@@ -1383,6 +2005,13 @@ prepare_image_rebuild() {
 	else
 		rm -f "$manager_manifest"
 	fi
+}
+
+prepare_image_rebuild() {
+	detect_container || die "Neither podman nor docker is installed."
+	require_flock
+	lifecycle_lock
+	prepare_image_rebuild_locked
 }
 
 rebuild_image_transaction() {
@@ -1489,104 +2118,254 @@ run_container() {
 }
 
 start_tun() {
-	host=$1
+	tun_initial_host=$1
 	shift
-	detect_container || die "Neither podman nor docker is installed."
-	need_dir "$workdir"
-	need_dir "$ssh_config"
-	[ -f "$config" ] || die "VPN configuration file not found: $config (run '$PROGRAM init')"
-	if [ -e "$credentials" ] && [ ! -f "$credentials" ]; then
-		die "VPN credentials path is not a regular file: $credentials"
-	fi
-	[ "$#" -gt 0 ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
-
-	if container_is_running_named "$TUN_CONTAINER_NAME"; then
-		die "Tunnel '$TUN_CONTAINER_NAME' is already running; use '$PROGRAM tun --stop' first."
-	fi
-	publish_args=
-	forward_args=
-	seen_ports=
-	published_ports=
-	while [ "$#" -gt 0 ]; do
-		mapping=$1
-		shift
-		case $mapping in
-			*:*:*)
-				local_port=${mapping%%:*}
-				remainder=${mapping#*:}
-				remote_host=${remainder%:*}
-				remote_port=${remainder##*:}
-				;;
-			*:* )
-				local_port=${mapping%%:*}
-				remote_host=localhost
-				remote_port=${mapping#*:}
-				;;
-			*) die "Invalid port mapping '$mapping'; expected local:remote or local:host:remote" ;;
-		esac
-		case $remote_host in ''|*[!A-Za-z0-9._-]*) die "Invalid remote host in mapping '$mapping'" ;; esac
-		for port in "$local_port" "$remote_port"; do
-			case $port in ''|*[!0-9]*) die "Invalid port in mapping '$mapping': $port" ;; esac
-			awk -v port="$port" 'BEGIN { exit !(port >= 1 && port <= 65535) }' || die "Port out of range in mapping '$mapping': $port"
-		done
-		case " $seen_ports " in *" $local_port "*) die "Duplicate local port in tunnel mappings: $local_port" ;; esac
-		seen_ports="$seen_ports $local_port"
-		published_ports="$published_ports 127.0.0.1:$local_port"
-		publish_args="$publish_args -p 127.0.0.1:$local_port:$local_port"
-		forward_args="$forward_args $mapping"
+	[ -n "$tun_initial_host" ] && [ "$#" -gt 0 ] || die "Usage: $PROGRAM tun <ssh-host> <local:remote|local:host:remote>..."
+	case $tun_initial_host in *'
+'*) die "Invalid SSH host." ;; esac
+	tun_initial_mappings=
+	tun_initial_mapping_count=0
+	tun_initial_seen_ports=
+	for tun_initial_mapping do
+		validate_tun_mapping "$tun_initial_mapping" || die "Invalid port mapping '$tun_initial_mapping'; expected valid local:remote or local:host:remote ports in 1..65535."
+		case " $tun_initial_seen_ports " in *" $tm_validate_local_number "*) die "Duplicate local port in tunnel mappings: $tm_validate_local_number" ;; esac
+		tun_initial_seen_ports="$tun_initial_seen_ports $tm_validate_local_number"
+		tun_initial_mappings="${tun_initial_mappings}${tun_initial_mappings:+ }$tun_initial_mapping"
+		tun_initial_mapping_count=$((tun_initial_mapping_count + 1))
 	done
-
-	if container_exists_named "$TUN_CONTAINER_NAME"; then
-		"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null
+	detect_container || die "Neither podman nor docker is installed."
+	[ -d "$workdir" ] || die "Work directory not found: $workdir"
+	[ -d "$ssh_config" ] || die "SSH configuration directory not found: $ssh_config"
+	[ -d "$config_dir" ] || die "VPN configuration directory not found: $config_dir"
+	[ -f "$config" ] || die "VPN configuration file not found: $config (run '$PROGRAM init')"
+	if [ -e "$credentials" ] && [ ! -f "$credentials" ]; then die "VPN credentials path is not a regular file: $credentials"; fi
+	require_flock
+	lifecycle_lock
+	if [ -e "$tunnel_pending" ] || [ -L "$tunnel_pending" ]; then
+		die "An interrupted tunnel transaction is pending. Run '$PROGRAM tun --stop', then start a fresh tunnel."
 	fi
+	"$container_command" info >/dev/null 2>&1 || die "Cannot verify the container engine; tunnel state was left untouched. Run '$PROGRAM tun --stop' for recovery."
+	if [ -e "$tunnel_manifest" ] || [ -L "$tunnel_manifest" ]; then
+		parse_tunnel_manifest || die "The saved tunnel manifest is invalid or insecure; tunnel state was retained. Run '$PROGRAM tun --stop' for recovery."
+		tun_stale_container_id=$tm_container_id
+		tun_container_authoritative_state "$tun_stale_container_id" || die "Could not prove the saved tunnel ID and exact target name absent; state was retained. The saved ID may still exist under another name. Run '$PROGRAM tun --stop' for recovery."
+		[ "$tun_authoritative_state" = absent ] || die "The saved tunnel ID or exact target name is still present; state was retained. Run '$PROGRAM tun --stop' for recovery."
+		rm -f "$tunnel_manifest" || die "The stale tunnel manifest could not be cleared after verifying container absence. Run '$PROGRAM tun --stop' for recovery."
+	else
+		tun_container_authoritative_state "" || die "Could not authoritatively verify that tunnel target '$TUN_CONTAINER_NAME' is absent; state was left untouched. Run '$PROGRAM tun --stop' for recovery."
+		[ "$tun_authoritative_state" = absent ] || die "Tunnel target '$TUN_CONTAINER_NAME' already exists; state was left untouched. Run '$PROGRAM tun --stop' before starting a fresh tunnel."
+	fi
+	tun_capture_initial_state || die "Cannot save valid tunnel startup paths or effective engine settings."
 	if [ "$rebuild" = 1 ]; then
-		rebuild_image_transaction
+		prepare_image_rebuild_locked
+		build_image
 		rebuild=0
 	elif ! "$container_command" image inspect "$IMAGE" >/dev/null 2>&1; then
 		build_image
 	fi
-
-	uid=$(id -u)
-	gid=$(id -g)
-	home_tmpfs_args "$uid" "$gid"
-	devpod_workspace_env_args
-	configure_runtime_mounts
-	IFS=' '
-	set -f
-	# The accumulated tokens contain only fixed flags, validated ports and
-	# validated hostnames; quote the SSH destination separately.
-	# shellcheck disable=SC2086
-	set -- $publish_args "$IMAGE" tun "$host" $forward_args
-	container_id=$(run_container_engine run --detach \
-		--name "$TUN_CONTAINER_NAME" \
-		--cap-add=NET_ADMIN \
-		--device /dev/net/tun \
-		--user "$uid:$gid" \
-		"$home_tmpfs_flag" "$home_tmpfs_value" \
-		--workdir /home/dev \
-		-e HOME=/home/dev \
-		${devpod_env_arg:+-e} ${devpod_env_arg:+"$devpod_env_arg"} \
-		-v "$config_mount" \
-		-v "$ssh_mount" \
-		-v "$work_mount" \
-		"$@") || die "Failed to start the tunnel container."
+	tm_pending_operation=initial
+	tm_pending_mappings=$tm_mappings
+	tm_pending_replacement_id=none
+	tm_container_id=
+	tm_started_container_id=
+	write_tunnel_pending || die "Cannot securely record the tunnel start transaction."
 	printf 'Starting tunnel container %s.\n' "$TUN_CONTAINER_NAME"
-	waited=0
-	while [ "$waited" -lt 110 ]; do
-		if ! container_is_running_named "$TUN_CONTAINER_NAME"; then
-			"$container_command" logs "$TUN_CONTAINER_NAME" >&2 2>/dev/null || true
-			"$container_command" container rm "$TUN_CONTAINER_NAME" >/dev/null 2>&1 || true
-			die "Tunnel exited during startup. Check the VPN and non-interactive SSH key configuration."
+	if tun_start_saved_configuration; then
+		:
+	else
+		if [ -n "$tm_started_container_id" ] && tun_remove_created_container "$tm_started_container_id"; then
+			rm -f "$tunnel_manifest" "$tunnel_pending"
+			die "Tunnel startup failed before readiness. Check the VPN and non-interactive SSH key configuration, then retry '$PROGRAM tun HOST MAPPING...'."
 		fi
-		if "$container_command" exec "$TUN_CONTAINER_NAME" test -f /tmp/sd-vpnc-tun-ready >/dev/null 2>&1; then
-			printf 'Tunnel ready on%s. Use %s tun --stop to close it.\n' "$published_ports" "$PROGRAM"
-			printf 'Container id: %s\n' "$container_id"
+		die "Tunnel startup failed before readiness and cleanup could not be verified; the tunnel may remain. Run '$PROGRAM tun --stop' to recover, then retry '$PROGRAM tun HOST MAPPING...'."
+	fi
+	tm_mapping_count=$tun_initial_mapping_count
+	if ! write_tunnel_manifest; then
+		if tun_remove_created_container "$tm_container_id"; then
+			rm -f "$tunnel_manifest" "$tunnel_pending"
+			die "Tunnel became ready but its private manifest could not be committed; the tunnel was removed."
+		fi
+		die "Tunnel became ready but its private manifest could not be committed and cleanup could not be verified; the tunnel may remain. Run '$PROGRAM tun --stop' to recover."
+	fi
+	rm -f "$tunnel_pending" || die "Tunnel is ready, but pending state could not be cleared; run '$PROGRAM tun --stop' before further tunnel operations."
+	lifecycle_unlock
+	printf 'Tunnel ready on'
+	for tun_initial_mapping in $tun_initial_mappings; do
+		validate_tun_mapping "$tun_initial_mapping"
+		printf ' 127.0.0.1:%s' "$tm_validate_local_number"
+	done
+	printf '. Use %s tun --stop to close it.\n' "$PROGRAM"
+	printf 'Container id: %s\n' "$tm_container_id"
+}
+
+confirm_tunnel_change() {
+	printf 'Warning: container port publications are immutable. This change will stop and recreate the tunnel, interrupting all forwarded connections.\n' >&2
+	if [ "$tun_mutation_action" = add ]; then
+		printf 'Adding mapping: %s\n' "$tun_mutation_argument" >&2
+	else
+		printf 'Removing mapping: %s\n' "$tun_removed_mapping" >&2
+	fi
+	if [ -n "$tun_proposed_mappings" ]; then
+		printf 'Proposed mappings: %s\n' "$tun_proposed_mappings" >&2
+	else
+		printf 'No mappings will remain; the tunnel will be stopped.\n' >&2
+	fi
+	if [ "$tun_mutation_yes" = 1 ]; then return 0; fi
+	if [ ! -t 0 ]; then
+		printf "Non-interactive port changes require explicit --yes; no tunnel state was changed.\n" >&2
+		return 1
+	fi
+	printf 'Continue? [y/N] ' >/dev/tty || return 1
+	IFS= read -r tun_confirmation </dev/tty || return 1
+	case $tun_confirmation in y|Y|yes|YES|Yes) return 0 ;; *) printf 'Tunnel change cancelled; no state was changed.\n' >&2; return 1 ;; esac
+}
+
+save_old_tunnel_fields() {
+	tun_old_container_id=$tm_container_id
+	tun_old_host=$tm_host
+	tun_old_mappings=$tm_mappings
+	tun_old_mapping_count=$tm_mapping_count
+	tun_old_engine=$tm_engine
+	tun_old_engine_context=$tm_engine_context
+	tun_old_uid=$tm_uid
+	tun_old_gid=$tm_gid
+	tun_old_image=$tm_image
+	tun_old_workdir=$tm_workdir
+	tun_old_config_dir=$tm_config_dir
+	tun_old_config=$tm_config
+	tun_old_credentials_present=$tm_credentials_present
+	tun_old_credentials=$tm_credentials
+	tun_old_ssh_source=$tm_ssh_source
+	tun_old_mount_mode=$tm_mount_mode
+	tun_old_workspace_present=$tm_workspace_present
+	tun_old_workspace_value=$tm_workspace_value
+}
+
+restore_old_tunnel_fields() {
+	tm_container_id=$tun_old_container_id
+	tm_host=$tun_old_host
+	tm_mappings=$tun_old_mappings
+	tm_mapping_count=$tun_old_mapping_count
+	tm_engine=$tun_old_engine
+	tm_engine_context=$tun_old_engine_context
+	tm_uid=$tun_old_uid
+	tm_gid=$tun_old_gid
+	tm_image=$tun_old_image
+	tm_workdir=$tun_old_workdir
+	tm_config_dir=$tun_old_config_dir
+	tm_config=$tun_old_config
+	tm_credentials_present=$tun_old_credentials_present
+	tm_credentials=$tun_old_credentials
+	tm_ssh_source=$tun_old_ssh_source
+	tm_mount_mode=$tun_old_mount_mode
+	tm_workspace_present=$tun_old_workspace_present
+	tm_workspace_value=$tun_old_workspace_value
+}
+
+mutation_fail_and_recover() {
+	tun_failed_replacement_id=${tm_started_container_id:-${tm_pending_replacement_id:-}}
+	[ -n "$tun_failed_replacement_id" ] && [ "$tun_failed_replacement_id" != none ] || die "The failed replacement ID is unknown, so rollback was not started. Pending and manifest state were retained; inspect and manually clean up the exact tunnel target, then retry '$PROGRAM tun --stop'."
+	if ! tun_remove_created_container "$tun_failed_replacement_id"; then
+		die "The failed replacement ID could not be authoritatively verified absent, so rollback was not started. Manifest and pending state were retained; run '$PROGRAM tun --stop' or explicitly clean up that ID manually."
+	fi
+	restore_old_tunnel_fields
+	tm_pending_replacement_id=none
+	write_tunnel_pending || die "The failed replacement is absent, but rollback state could not be updated. Manifest and pending state were retained; run '$PROGRAM tun --stop'."
+	rm -f "$tunnel_manifest" || die "The failed replacement is absent, but the stale manifest could not be removed. Pending state was retained; run '$PROGRAM tun --stop'."
+	tm_container_id=
+	write_tunnel_pending || die "The stale manifest is absent, but rollback state could not be updated. Pending state was retained; run '$PROGRAM tun --stop'."
+	if tun_start_saved_configuration; then
+		tm_mapping_count=$tun_old_mapping_count
+		if write_tunnel_manifest; then
+			rm -f "$tunnel_pending" || die "The previous tunnel was restored, but pending state could not be cleared. Run '$PROGRAM tun --stop' before further tunnel operations."
+			die "The requested tunnel change failed; the previous tunnel was restored."
+		fi
+	fi
+	if [ -n "${tm_started_container_id:-}" ] && tun_remove_created_container "$tm_started_container_id"; then
+		rm -f "$tunnel_manifest" || die "Rollback failed and the partial replacement is absent, but its manifest could not be removed. Pending state was retained; run '$PROGRAM tun --stop'."
+		die "Tunnel change and rollback both failed. No managed tunnel is claimed; run '$PROGRAM tun --stop' to clear recovery state, then start again with '$PROGRAM tun HOST MAPPING...'."
+	fi
+	die "Tunnel change and rollback failed, and cleanup of the rollback ID could not be verified. Manifest and pending state were retained; run '$PROGRAM tun --stop' or manually clean up the saved ID."
+}
+
+mutate_tunnel_ports() {
+	tun_mutation_action=$1
+	tun_mutation_argument=$2
+	tun_mutation_yes=$3
+	detect_container || die "Neither podman nor docker is installed."
+	tun_proposed_mappings=
+	if [ "$tun_mutation_action" = add ]; then
+		validate_tun_mapping "$tun_mutation_argument" || die "Invalid mapping '$tun_mutation_argument'; expected one complete valid mapping."
+		tun_requested_local=$tm_validate_local_number
+	else
+		normalize_tun_port "$tun_mutation_argument" || die "Invalid local port '$tun_mutation_argument'; expected a decimal port in 1..65535."
+		tun_requested_local=$normalized_port
+	fi
+	tun_require_valid_active_state || exit 1
+	save_old_tunnel_fields
+	tun_reviewed_id=$tm_container_id
+	tun_reviewed_manifest=$(cat "$tunnel_manifest")
+	tun_seen_local_ports=
+	tun_removed_mapping=
+	set -f
+	for tun_existing_mapping in $tm_mappings; do
+		validate_tun_mapping "$tun_existing_mapping" || die "Saved tunnel mapping state is invalid; run '$PROGRAM tun --stop' and start fresh."
+		case " $tun_seen_local_ports " in *" $tm_validate_local_number "*) die "Saved tunnel mapping state contains duplicate local ports; run '$PROGRAM tun --stop' and start fresh." ;; esac
+		tun_seen_local_ports="$tun_seen_local_ports $tm_validate_local_number"
+		if [ "$tun_mutation_action" = add ]; then
+			[ "$tm_validate_local_number" != "$tun_requested_local" ] || die "Local port $tun_requested_local is already published."
+			tun_proposed_mappings="${tun_proposed_mappings}${tun_proposed_mappings:+ }$tun_existing_mapping"
+		else
+			if [ "$tm_validate_local_number" = "$tun_requested_local" ]; then
+				tun_removed_mapping=$tun_existing_mapping
+			else
+				tun_proposed_mappings="${tun_proposed_mappings}${tun_proposed_mappings:+ }$tun_existing_mapping"
+			fi
+		fi
+	done
+	if [ "$tun_mutation_action" = add ]; then
+		tun_proposed_mappings="${tun_proposed_mappings}${tun_proposed_mappings:+ }$tun_mutation_argument"
+	else
+		[ -n "$tun_removed_mapping" ] || die "Local port $tun_requested_local is not published."
+	fi
+	confirm_tunnel_change || exit 1
+	lifecycle_lock
+	if [ -e "$tunnel_pending" ] || [ -L "$tunnel_pending" ]; then die "A tunnel transaction changed during confirmation; run '$PROGRAM tun --stop' and retry from a fresh start."; fi
+	tun_require_valid_active_state || exit 1
+	tun_locked_manifest=$(cat "$tunnel_manifest")
+	[ "$tun_locked_manifest" = "$tun_reviewed_manifest" ] && [ "$tm_container_id" = "$tun_reviewed_id" ] || die "The tunnel changed during confirmation; no changes were made. Retry against the current tunnel."
+	tm_pending_operation=$tun_mutation_action
+	tm_pending_mappings=$tun_proposed_mappings
+	tm_pending_replacement_id=none
+	write_tunnel_pending || die "Cannot securely record the tunnel change transaction; no container was changed."
+	if ! tun_inspect_identity || [ "$tun_inspected_id" != "$tun_old_container_id" ] || ! container_is_running_named "$TUN_CONTAINER_NAME"; then
+		rm -f "$tunnel_pending"
+		die "The tunnel changed before mutation; no container was changed. Retry against the current tunnel."
+	fi
+	if [ -z "$tun_proposed_mappings" ]; then
+		tun_remove_named_container "$tun_old_container_id" || die "The final-port removal could not authoritatively verify tunnel absence; manifest and pending recovery state were retained. Run '$PROGRAM tun --stop' for recovery."
+		rm -f "$tunnel_manifest" "$tunnel_pending" || die "Tunnel is absent, but its state could not be cleared; run '$PROGRAM tun --stop'."
+		lifecycle_unlock
+		printf 'Removed the final tunnel mapping and stopped %s.\n' "$TUN_CONTAINER_NAME"
+		return 0
+	fi
+	if ! tun_remove_created_container "$tun_old_container_id"; then
+		die "The old tunnel could not be authoritatively removed; manifest and pending state were retained. Run '$PROGRAM tun --stop' or inspect the saved ID manually."
+	fi
+	tm_container_id=
+	write_tunnel_pending || die "The old tunnel is absent, but replacement state could not be updated. Pending state was retained; run '$PROGRAM tun --stop'."
+	tm_mappings=$tun_proposed_mappings
+	# shellcheck disable=SC2086
+	set -- $tm_mappings
+	tm_mapping_count=$#
+	if tun_start_saved_configuration; then
+		if write_tunnel_manifest && rm -f "$tunnel_pending"; then
+			lifecycle_unlock
+			printf 'Tunnel mappings updated. New mappings:%s\n' "$tm_mappings"
 			return 0
 		fi
-		sleep 1
-		waited=$((waited + 1))
-	done
-	printf 'Tunnel is still starting. Run %s status to check it, or %s tun --stop to cancel.\n' "$PROGRAM" "$PROGRAM"
+	fi
+	mutation_fail_and_recover
 }
 
 container_command=
@@ -1640,8 +2419,10 @@ Connection commands (these may establish a VPN connection):
   $PROGRAM ssh [ssh-args...]       Start VPN; forward all arguments unchanged to ssh.
   $PROGRAM ssh HOST remote-command
   $PROGRAM ssh-tmux HOST [SESSION] Start SSH, optionally in a remote tmux session.
-  $PROGRAM tun HOST MAPPING...   Start host-published forwards (LOCAL:REMOTE or LOCAL:HOST:REMOTE).
-  $PROGRAM tun --stop             Stop the background port-forward container.
+  $PROGRAM tun HOST MAPPING...      Start host-published forwards (LOCAL:REMOTE or LOCAL:HOST:REMOTE).
+  $PROGRAM tun --stop               Stop the background port-forward container.
+  $PROGRAM tun-add-port MAPPING [--yes]  Add one mapping to a verified running tunnel.
+  $PROGRAM tun-rm-port LOCAL [--yes]     Remove one local port from a verified tunnel.
   $PROGRAM shell                   Open a shell in the running VPN container, or start a VPN shell if none runs.
   $PROGRAM cli                     Alias for shell.
 
@@ -1649,7 +2430,17 @@ Use normal OpenSSH argument ordering: SSH options before the host, then an optio
 Bare 'ssh' (no destination or SSH arguments) starts a local interactive shell inside the VPN container. 'ssh HOST' invokes remote SSH and opens the remote default shell when no remote command is supplied.
 For host-accessible forwards, use 'tun' rather than 'ssh -L': tunnel ports are published
 on 127.0.0.1 of the host. Detached tunnels require SSH authentication without prompts.
-Use 'tun --stop' to close it. Regular shell, SSH, and SSH-tmux sessions share one
+Port changes require a running named TUN container with valid sd-vpnc ownership and
+private manifest; add/remove never start a tunnel. Use 'tun-add-port LOCAL:REMOTE [--yes]'
+or 'tun-add-port LOCAL:HOST:REMOTE [--yes]' to add exactly one full mapping, and
+'tun-rm-port LOCAL_PORT [--yes]' to remove one local port. Ports are decimal 1..65535;
+local-port comparisons are numeric, including leading-zero spellings. Reconfiguration
+interrupts all forwarded connections and requires an affirmative interactive response
+or explicit '--yes' for automation. The private manifest stores source paths, not file
+contents; later recreation and rollback use current file contents at those saved paths.
+If state is missing, mismatched, or pending after interruption, use 'tun --stop' then
+start fresh with 'tun HOST MAPPING...'. Use 'tun --stop' to close it. Regular shell,
+SSH, and SSH-tmux sessions share one
 persistent manager and execute separately; the manager stops after the final lease.
 Use 'shell' in another terminal to attach or start a local shell. The existing
 separate tunnel container remains the preferred 'shell' target when it is running.
@@ -1707,6 +2498,34 @@ EOF
 			shift
 			start_tun "$host" "$@"
 		fi
+		;;
+	tun-add-port)
+		tun_cli_mapping=
+		tun_cli_yes=0
+		tun_cli_count=0
+		for tun_cli_arg do
+			case $tun_cli_arg in
+				--yes) [ "$tun_cli_yes" = 0 ] || die "Usage: $PROGRAM tun-add-port <mapping> [--yes]"; tun_cli_yes=1 ;;
+				-*) die "Usage: $PROGRAM tun-add-port <mapping> [--yes]" ;;
+				*) tun_cli_mapping=$tun_cli_arg; tun_cli_count=$((tun_cli_count + 1)) ;;
+			esac
+		done
+		[ "$tun_cli_count" -eq 1 ] || die "Usage: $PROGRAM tun-add-port <mapping> [--yes]"
+		mutate_tunnel_ports add "$tun_cli_mapping" "$tun_cli_yes"
+		;;
+	tun-rm-port)
+		tun_cli_port=
+		tun_cli_yes=0
+		tun_cli_count=0
+		for tun_cli_arg do
+			case $tun_cli_arg in
+				--yes) [ "$tun_cli_yes" = 0 ] || die "Usage: $PROGRAM tun-rm-port <local-port> [--yes]"; tun_cli_yes=1 ;;
+				-*) die "Usage: $PROGRAM tun-rm-port <local-port> [--yes]" ;;
+				*) tun_cli_port=$tun_cli_arg; tun_cli_count=$((tun_cli_count + 1)) ;;
+			esac
+		done
+		[ "$tun_cli_count" -eq 1 ] || die "Usage: $PROGRAM tun-rm-port <local-port> [--yes]"
+		mutate_tunnel_ports remove "$tun_cli_port" "$tun_cli_yes"
 		;;
 	shell|cli)
 		[ "$#" -eq 0 ] || die "Usage: $PROGRAM shell"

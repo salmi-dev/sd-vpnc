@@ -133,17 +133,30 @@ case ${1:-} in
 				[ -d "$inspect_dir" ] || exit 1
 				if [ "${3:-}" = --format ]; then
 					case ${4:-} in
-						*State.Running*) printf 'true\n' ;;
+						*State.Running*) [ ! -f "$inspect_dir/stopped" ] && printf 'true\n' || printf 'false\n' ;;
+						*.Id*) cat "$inspect_dir/id" 2>/dev/null || printf 'fake-container-id\n' ;;
+						*io.sd-vpnc.tunnel*) grep '^io.sd-vpnc.tunnel=' "$inspect_dir/labels" 2>/dev/null | cut -d= -f2- || printf '\n' ;;
 						*io.sd-vpnc.manager*) cat "$inspect_dir/labels" 2>/dev/null || printf '\n' ;;
 						*) printf 'true\n' ;;
 					esac
 				fi
 				exit 0
 				;;
+			ls)
+				for container_dir in "$ENGINE_STATE"/containers/*; do
+					[ -d "$container_dir" ] || continue
+					printf '%s|%s\n' "$(cat "$container_dir/id")" "${container_dir##*/}"
+				done
+				exit 0
+				;;
 			rm|stop)
 				name=${3:-sd-vpnc-$(id -u)}
 				if [ -d "$ENGINE_STATE/containers/$name" ]; then
-					rm -rf "$ENGINE_STATE/containers/$name"
+					if [ "${2:-}" = stop ]; then
+						: > "$ENGINE_STATE/containers/$name/stopped"
+					else
+						rm -rf "$ENGINE_STATE/containers/$name"
+					fi
 					printf '%s\n' "${2}-container" >> "$ENGINE_STATE/events"
 				fi
 				exit 0
@@ -160,9 +173,14 @@ case ${1:-} in
 		done
 		[ -n "$name" ] || name=sd-vpnc-$(id -u)
 		mkdir -p "$ENGINE_STATE/containers/$name"
+		sequence=0
+		[ ! -f "$ENGINE_STATE/id-sequence" ] || sequence=$(cat "$ENGINE_STATE/id-sequence")
+		sequence=$((sequence + 1))
+		printf '%s\n' "$sequence" > "$ENGINE_STATE/id-sequence"
+		printf 'fake-container-id-%s\n' "$sequence" > "$ENGINE_STATE/containers/$name/id"
 		if [ "$name" = "sd-vpnc-tun-$(id -u)" ]; then
-			printf 'tunnel\n' > "$ENGINE_STATE/containers/$name/labels"
-			: > "$ENGINE_STATE/containers/$name/tun-ready"
+			printf 'io.sd-vpnc.tunnel=sd-vpnc\n' > "$ENGINE_STATE/containers/$name/labels"
+			[ "${FAKE_TUN_NOT_READY:-0}" = 1 ] || : > "$ENGINE_STATE/containers/$name/tun-ready"
 			printf 'tunnel-start\n' >> "$ENGINE_STATE/events"
 		else
 			printf 'sd-vpnc|1\n' > "$ENGINE_STATE/containers/$name/labels"
@@ -170,7 +188,7 @@ case ${1:-} in
 			: > "$ENGINE_STATE/containers/$name/ready"
 			printf 'manager-start\n' >> "$ENGINE_STATE/events"
 		fi
-		printf 'fake-container-id\n'
+		printf 'fake-container-id-%s\n' "$sequence"
 		exit 0
 		;;
 	exec)

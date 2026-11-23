@@ -268,7 +268,7 @@ make_fake_path() {
 make_path_without_git() {
 	RESTRICTED_BIN="$CASE_DIR/no-git-bin"
 	mkdir -p "$RESTRICTED_BIN"
-	for utility in cat chmod cp flock id mkdir mktemp rm; do
+	for utility in cat chmod cp flock id mkdir mktemp rm stat; do
 		utility_path=$(command -v "$utility") || fail "missing utility: $utility"
 		ln -s "$utility_path" "$RESTRICTED_BIN/$utility"
 	done
@@ -798,7 +798,7 @@ fi
 prepare_case docker-engine
 DOCKER_BIN="$CASE_DIR/docker-bin"
 mkdir -p "$DOCKER_BIN"
-for utility in cat chmod cp flock id mkdir mktemp rm mv sed grep; do
+for utility in cat chmod cp flock id mkdir mktemp rm mv sed grep stat; do
 	utility_path=$(command -v "$utility") || fail "missing utility: $utility"
 	ln -s "$utility_path" "$DOCKER_BIN/$utility"
 done
@@ -982,18 +982,27 @@ case ${1:-} in
 				if [ "${3:-}" = --format ]; then
 					case ${4:-} in
 						*State.Running*) printf 'true\n' ;;
+						*.Id*) cat "$RUNTIME_STATE.id" 2>/dev/null || printf 'fake-container-id\n' ;;
+						*io.sd-vpnc.tunnel*) printf 'sd-vpnc\n' ;;
 						*io.sd-vpnc.manager*) printf 'sd-vpnc|1\n' ;;
 						*) printf 'true\n' ;;
 					esac
 				fi
 				exit 0
 				;;
+			ls) exit 0 ;;
 			rm|stop) rm -f "$RUNTIME_STATE"; exit 0 ;;
 		esac
 		;;
 	image) exit 0 ;;
 	run)
-		case " $* " in *' --detach '*) : > "$RUNTIME_STATE"; printf 'fake-container-id\n' ;; esac
+		case " $* " in
+			*' --detach '*)
+				: > "$RUNTIME_STATE"
+				case " $* " in *'--name sd-vpnc-tun-'*) printf 'fake-container-id\n' > "$RUNTIME_STATE.id" ;; esac
+				printf 'fake-container-id\n'
+				;;
+		esac
 		exit 0
 		;;
 	exec)
@@ -1065,7 +1074,7 @@ make_runtime_podman_path() {
 make_runtime_docker_path() {
 	DOCKER_RUNTIME_BIN="$CASE_DIR/runtime-docker-bin"
 	mkdir -p "$DOCKER_RUNTIME_BIN"
-	for utility in awk cat chmod cmp date flock grep id mkdir mv od rm sed sleep tr; do
+	for utility in awk base64 cat chmod cmp date flock grep id mkdir mktemp mv od rm sed sleep stat tail tr wc; do
 		utility_path=$(command -v "$utility") || fail "missing runtime utility: $utility"
 		ln -s "$utility_path" "$DOCKER_RUNTIME_BIN/$utility"
 	done
