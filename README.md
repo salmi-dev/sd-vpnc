@@ -229,6 +229,55 @@ complete without prompts. Pre-accept the host key (e.g. by connecting with
 `sd-vpnc ssh HOST`) and use a key that requires no passphrase prompt;
 password/passphrase prompts are not supported by this command.
 
+### Change tunnel port forwards
+
+The initial command remains `sd-vpnc tun SSH_HOST MAPPING...`; provide one or
+more complete `LOCAL:REMOTE` or `LOCAL:HOST:REMOTE` mappings. Ports must be
+decimal values in `1..65535` (leading zeroes are accepted), local ports must be
+unique by numeric value, and optional remote hosts use letters, digits, `.`, `_`,
+and `-`. Publications are bound to host loopback.
+
+To change forwards later, the per-user named TUN container must already be
+running and must match sd-vpnc's private, mode-0600 tunnel manifest. These
+commands never start a tunnel implicitly:
+
+```bash
+sd-vpnc tun-add-port 9443:443
+sd-vpnc tun-add-port 8443:db.internal:443 --yes  # explicit automation consent
+sd-vpnc tun-rm-port 8080
+sd-vpnc tun-rm-port 9443 --yes
+```
+
+`tun-add-port` takes exactly one complete mapping and rejects a duplicate local
+port even if one spelling has leading zeroes. `tun-rm-port` takes exactly one
+local port; it matches numerically, so `tun-rm-port 8080` removes a saved
+mapping spelled `08080:80`. Removing an absent or invalid port fails without
+changing the tunnel.
+
+Container port publications cannot be changed in place. A mapping change stops
+and recreates the tunnel, interrupting every forwarded connection. Interactive
+use prints this warning and requires an affirmative confirmation. Automation
+must explicitly pass `--yes`; without it, non-interactive callers fail without
+mutation. Removing the final mapping uses the same confirmation, then stops the
+container and clears its manifest instead of starting a zero-port tunnel.
+
+After a successful initial start, sd-vpnc stores the SSH host, ordered mappings,
+container identity, effective engine/context and startup options, and source
+paths in a private versioned manifest. It does not store config, credential,
+or SSH file contents. Confirmed recreation and rollback use the current
+contents at those saved source paths, so edits to the files are picked up. A
+changed engine/context or startup path, missing/unrecognized container,
+invalid/insecure manifest, or interrupted pending transaction fails closed.
+Use `sd-vpnc tun --stop` to remove the exact named tunnel and clear stale state,
+then start fresh with `sd-vpnc tun SSH_HOST MAPPING...`. If recreation fails,
+sd-vpnc attempts to restore the previous host and mapping set using current
+source contents; if both replacement and rollback fail, no managed tunnel is
+claimed and the same stop-then-fresh-start recovery applies. An initial start
+that misses the 110-second readiness deadline is stopped/removed and can be
+retried with the original `tun SSH_HOST MAPPING...` command. The prompt-free
+`tun --stop` command also cleans up a legacy or unrecognized container at the
+exact per-user tunnel name.
+
 Regular `ssh`, `ssh-tmux`, and `shell` sessions share one detached VPN manager.
 The first request starts the manager, which starts OpenVPN once and remains
 alive independently of client commands. Each request uses its own engine `exec`
