@@ -582,6 +582,11 @@ home_tmpfs_args() {
 	esac
 }
 
+devpod_workspace_env_args() {
+	devpod_env_arg=
+	[ -z "${DEVPOD_WORKSPACE_ID:-}" ] || devpod_env_arg="DEVPOD_WORKSPACE_ID=$DEVPOD_WORKSPACE_ID"
+}
+
 configure_runtime_mounts() {
 	podman_rootless=false
 	config_mount="$config_dir:/config:ro"
@@ -753,6 +758,7 @@ run_container() {
 	uid=$(id -u)
 	gid=$(id -g)
 	home_tmpfs_args "$uid" "$gid"
+	devpod_workspace_env_args
 	configure_runtime_mounts
 	run_container_engine run --rm -it \
 		--name "$CONTAINER_NAME" \
@@ -762,6 +768,7 @@ run_container() {
 		"$home_tmpfs_flag" "$home_tmpfs_value" \
 		--workdir /home/dev \
 		-e HOME=/home/dev \
+		${devpod_env_arg:+-e} ${devpod_env_arg:+"$devpod_env_arg"} \
 		-v "$config_mount" \
 		-v "$ssh_mount" \
 		-v "$work_mount" \
@@ -826,6 +833,7 @@ start_tun() {
 	uid=$(id -u)
 	gid=$(id -g)
 	home_tmpfs_args "$uid" "$gid"
+	devpod_workspace_env_args
 	configure_runtime_mounts
 	IFS=' '
 	set -f
@@ -841,6 +849,7 @@ start_tun() {
 		"$home_tmpfs_flag" "$home_tmpfs_value" \
 		--workdir /home/dev \
 		-e HOME=/home/dev \
+		${devpod_env_arg:+-e} ${devpod_env_arg:+"$devpod_env_arg"} \
 		-v "$config_mount" \
 		-v "$ssh_mount" \
 		-v "$work_mount" \

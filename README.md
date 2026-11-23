@@ -231,6 +231,12 @@ installer may add it. Shell history is written under
 `sd-vpnc ssh HOST` invokes remote SSH and opens the remote default shell when no
 remote command is supplied; it does not select a local Zsh/Bash session.
 
+When the host environment has a non-empty `DEVPOD_WORKSPACE_ID`, `sd-vpnc`
+forwards its value to the runtime container, for both regular containers and the
+detached `sd-vpnc tun` container, so tools such as Starship can display it. If it
+is unset or empty, nothing is forwarded and launch is unchanged. No other host
+environment variable is forwarded.
+
 `--workdir`/`-C` mounts a host directory as `/work` inside the container. The
 option is the reliable way to choose a project directory; a container cannot
 change the current directory of its parent shell.
