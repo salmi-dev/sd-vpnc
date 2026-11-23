@@ -30,6 +30,25 @@ sd-vpnc --rebuild
 The image is built locally, so no registry account or published image is
 required.
 
+## Development setup
+
+The repository pins its development tools in `mise.toml`. From the repository
+root, install them with:
+
+```bash
+mise install
+```
+
+Apply configured host packages with:
+
+```bash
+mise bootstrap packages apply
+```
+
+The configured `flock` package is the standalone Homebrew formula and applies
+only on macOS; Homebrew must be installed. On Linux, install `flock` from your
+distribution's `util-linux` package instead.
+
 ## Configuration
 
 Create the configuration directory and copy the example files:
@@ -235,9 +254,10 @@ process/engine inspection is uncertain, the lease and manager are preserved;
 this can leave a manager running until the uncertainty is resolved.
 
 Lifecycle start/attach/last-session transitions require the host `flock`
-utility (provided by util-linux). The command checks for it before changing
-container state and fails closed with installation guidance if it is missing;
-there is no racy shell-lock fallback. Private lifecycle metadata is stored in
+utility (provided by Linux `util-linux`; on macOS, install it with
+`brew install flock`). The command checks for it before changing container
+state and fails closed with installation guidance if it is missing; there is
+no racy shell-lock fallback. Private lifecycle metadata is stored in
 `$XDG_STATE_HOME/sd-vpnc` or `~/.local/state/sd-vpnc`.
 
 Open another terminal and run:
@@ -276,7 +296,8 @@ change the current directory of its parent shell.
 - Podman or Docker
 - `/dev/net/tun` on the host
 - Permission to run containers with `NET_ADMIN`
-- The host `flock` utility (util-linux) for serialized manager lifecycle changes
+- The host `flock` utility for serialized manager lifecycle changes (Linux:
+  `util-linux`; macOS: `brew install flock`)
 - An OpenVPN provider configuration
 
 The runtime process uses the invoking host UID:GID, and runtime files in `/work`
